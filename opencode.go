@@ -162,3 +162,47 @@ func (c *OCClient) Abort(ctx context.Context, sessionID string) error {
 	return c.doJSON(ctx, http.MethodPost,
 		"/session/"+url.PathEscape(sessionID)+"/abort", nil, nil)
 }
+
+// ---------- سؤال‌های تعاملی (مثل CLI خود opencode) ----------
+
+type QOption struct {
+	Label       string `json:"label"`
+	Description string `json:"description"`
+}
+
+type QInfo struct {
+	Question string    `json:"question"`
+	Header   string    `json:"header"`
+	Options  []QOption `json:"options"`
+	Multiple bool      `json:"multiple,omitempty"`
+	Custom   *bool     `json:"custom,omitempty"` // nil یعنی true (پاسخ آزاد مجاز)
+}
+
+type QRequest struct {
+	ID        string  `json:"id"`
+	SessionID string  `json:"sessionID"`
+	Questions []QInfo `json:"questions"`
+	Tool      *struct {
+		MessageID string `json:"messageID"`
+		CallID    string `json:"callID"`
+	} `json:"tool,omitempty"`
+}
+
+func (c *OCClient) ListQuestions(ctx context.Context) ([]QRequest, error) {
+	var list []QRequest
+	if err := c.doJSON(ctx, http.MethodGet, "/question", nil, &list); err != nil {
+		return nil, err
+	}
+	return list, nil
+}
+
+func (c *OCClient) ReplyQuestion(ctx context.Context, requestID string, answers [][]string) error {
+	body := map[string]any{"answers": answers}
+	return c.doJSON(ctx, http.MethodPost,
+		"/question/"+url.PathEscape(requestID)+"/reply", body, nil)
+}
+
+func (c *OCClient) RejectQuestion(ctx context.Context, requestID string) error {
+	return c.doJSON(ctx, http.MethodPost,
+		"/question/"+url.PathEscape(requestID)+"/reject", nil, nil)
+}

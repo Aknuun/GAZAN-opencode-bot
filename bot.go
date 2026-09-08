@@ -38,7 +38,9 @@ const helpText = `ربات کنترل opencode روی سرور
 /cancel      توقف اجرای نشست فعال
 /help        این راهنما
 
-حین اجرا پاسخ به‌صورت زنده به‌روز می‌شود؛ روی پیام «در حال انجام» دکمهٔ ⏹ توقف همان نشست است.`
+حین اجرا پاسخ به‌صورت زنده به‌روز می‌شود؛ روی پیام «در حال انجام» دکمهٔ ⏹ توقف همان نشست است.
+
+اگر مدل در میانهٔ کار سؤالی بپرسد (مثل خود CLI)، همان پیام گزینه‌ها را دارد؛ با دکمه‌ها پاسخ بده تا اجرا ادامه یابد. ✏️ یعنی می‌توانی پاسخ خودت را تایپ کنی.`
 
 const (
 	btnStatus    = "📊 وضعیت و هزینه"
@@ -78,6 +80,10 @@ type Bot struct {
 	states map[int64]*UserState
 	runs   map[string]*runCtl // کلید = نشست opencode
 	cost   map[int64]costInfo
+
+	qmu  sync.Mutex
+	qmap map[string]*pendingQ // توکن کوتاه → سؤال در انتظار پاسخ
+	qseq int64
 }
 
 type costInfo struct {
@@ -93,6 +99,7 @@ func newBot(cfg *Config, api *tgbotapi.BotAPI) *Bot {
 		states: map[int64]*UserState{},
 		runs:   map[string]*runCtl{},
 		cost:   map[int64]costInfo{},
+		qmap:   map[string]*pendingQ{},
 	}
 }
 
@@ -556,6 +563,8 @@ func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
 		b.onSettingsCallback(userID, chatID, cq.Message.MessageID, data)
 	case strings.HasPrefix(data, "ss:"):
 		b.onSessionsCallback(userID, chatID, cq.Message.MessageID, data)
+	case strings.HasPrefix(data, "qa:"):
+		b.onQCallback(chatID, data)
 	case strings.HasPrefix(data, "stop:"):
 		sid := strings.TrimPrefix(data, "stop:")
 		b.stopRun(sid)
@@ -785,6 +794,10 @@ func (b *Bot) submitPrompt(userID, chatID int64, prompt, label string) {
 	}
 	sid := st.SessionID
 	if _, busy := b.runFor(sid); busy {
+		if b.qForChat(chatID) != nil {
+			b.send(chatID, "مدل سؤالی پرسیده؛ با دکمه‌های همان پیام پاسخ بده (یا ✏️ بنویس).")
+			return
+		}
 		b.send(chatID, "این نشست الان در حال اجراست.\nبا دکمهٔ 🗂 نشست‌ها یک نشست دیگر بساز یا یکی از نشست‌ها را انتخاب کن تا هم‌زمان جلو برویم.")
 		return
 	}
@@ -849,12 +862,14 @@ func (b *Bot) poll(ctx context.Context, r *runCtl, progressMsg int) string {
 					}
 					return curText
 				}
-				if qs := pendingQuestions(msg); qs != "" {
-					b.oc.Abort(ctx, r.SID)
-					if curText == "" {
-						curText = "⚠️ پاسخ ناقص تولید شد."
+				if hasPendingQuestion(msg) {
+					if b.answerQuestion(ctx, r, progressMsg, curText, msg.Info.ID) {
+						return "⛔ متوقف شد."
 					}
-					return curText + "\n\n— — —\n" + qs + "\n\n(ربات تلگرام نمی‌تواند به سؤال‌های ابزار پاسخ دهد، برای همین این اجرا متوقف شد. پاسخ‌ها را مستقیم بنویس تا ادامه بدهد.)"
+					// بعد از پاسخ به سؤال، وضعیت زنده را از نو نشان بده
+					lastShown = ""
+					lastEdit = time.Time{}
+					continue
 				}
 			}
 
@@ -1063,7 +1078,7 @@ func isFinalFinish(finish string) bool {
 	return true
 }
 
-func pendingQuestions(msg *OCMessage) string {
+func hasPendingQuestion(msg *OCMessage) bool {
 	for _, p := range msg.Parts {
 		if p.Type != "tool" || p.Tool != "question" || p.State == nil {
 			continue
@@ -1071,47 +1086,9 @@ func pendingQuestions(msg *OCMessage) string {
 		if p.State.Status == "completed" || p.State.Status == "error" {
 			continue
 		}
-		var sb strings.Builder
-		sb.WriteString("🤔 مدل در پایانِ پاسخ این سؤال‌ها را پرسید:")
-		if qs, ok := p.State.Input["questions"].([]any); ok {
-			for i, raw := range qs {
-				q, ok := raw.(map[string]any)
-				if !ok {
-					continue
-				}
-				sb.WriteString("\n\n")
-				fmt.Fprintf(&sb, "%d) %s", i+1, anyStr(q["question"]))
-				if h := anyStr(q["header"]); h != "" {
-					sb.WriteString("\n   [" + h + "]")
-				}
-				if opts, ok := q["options"].([]any); ok {
-					for _, oraw := range opts {
-						om, ok := oraw.(map[string]any)
-						if !ok {
-							continue
-						}
-						opt := anyStr(om["label"])
-						if d := anyStr(om["description"]); d != "" {
-							opt += " — " + d
-						}
-						sb.WriteString("\n   • " + opt)
-					}
-				}
-			}
-		}
-		return sb.String()
+		return true
 	}
-	return ""
-}
-
-func anyStr(v any) string {
-	if v == nil {
-		return ""
-	}
-	if s, ok := v.(string); ok {
-		return strings.TrimSpace(s)
-	}
-	return ""
+	return false
 }
 
 func joinText(msg *OCMessage) string {

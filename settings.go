@@ -408,6 +408,14 @@ func (b *Bot) handlePending(userID, chatID int64, pending, text string) {
 		arg = parts[1]
 	}
 	switch kind {
+	case "qtext":
+		// پاسخِ آزاد کاربر به سؤالِ تعاملی مدل
+		p := b.qByToken(arg)
+		if p == nil || p.chatID != chatID {
+			b.send(chatID, "دیگر در انتظار پاسخی نیست.")
+			return
+		}
+		b.qSendEvent(p, qEvent{kind: qEvText, text: text})
 	case "rn":
 		// تغییر نام (عنوان فارسی) یک نشست
 		sid := arg
