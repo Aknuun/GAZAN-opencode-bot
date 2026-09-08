@@ -1,0 +1,338 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+)
+
+// ocEnv مدیریت فایل‌های کانفیگ و auth خود opencode روی سرور
+type ocEnv struct {
+	ConfigDir string // پوشه‌ای که opencode.json[c] در آن است
+	DataDir   string // پوشه‌ای که auth.json در آن است
+	Service   string // نام سرویس systemd سرور opencode (خالی = غیرقابل ری‌استارت)
+	Port      string // پورت سرور opencode (برای شناسایی سرویس)
+}
+
+var (
+	reModelLine = regexp.MustCompile(`^([ \t]{0,2})"(model|small_model)"[ \t]*:[ \t]*"[^"]*"(.*)$`)
+	reModelVal  = regexp.MustCompile(`^([ \t]{0,2})"(model|small_model)"[ \t]*:[ \t]*"([^"]*)"(.*)$`)
+	reSchema    = regexp.MustCompile(`^([ \t]{0,2})"\$schema"`)
+)
+
+func newOCEnv(cfg *Config) *ocEnv {
+	e := &ocEnv{Port: portOf(cfg.BaseURL), Service: cfg.OCService}
+	home, _ := os.UserHomeDir()
+	xdgCfg := os.Getenv("XDG_CONFIG_HOME")
+	if xdgCfg == "" {
+		xdgCfg = filepath.Join(home, ".config")
+	}
+	xdgData := os.Getenv("XDG_DATA_HOME")
+	if xdgData == "" {
+		xdgData = filepath.Join(home, ".local", "share")
+	}
+	if cfg.OCConfigHome != "" {
+		e.ConfigDir = cfg.OCConfigHome
+	} else {
+		e.ConfigDir = filepath.Join(xdgCfg, "opencode")
+	}
+	if cfg.OCDataHome != "" {
+		e.DataDir = cfg.OCDataHome
+	} else {
+		e.DataDir = filepath.Join(xdgData, "opencode")
+	}
+	if e.Service == "" {
+		e.Service = detectOCService(e.Port)
+	}
+	return e
+}
+
+func portOf(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	if p := u.Port(); p != "" {
+		return p
+	}
+	return ""
+}
+
+// detectOCService پیدا کردن سرویس systemd در حال اجرای opencode serve
+func detectOCService(port string) string {
+	out, err := exec.Command("systemctl", "--no-legend", "list-units", "--type=service", "--state=running").Output()
+	if err != nil {
+		return ""
+	}
+	var cands []string
+	for _, line := range strings.Split(string(out), "\n") {
+		f := strings.Fields(line)
+		if len(f) == 0 || !strings.Contains(f[0], "opencode") {
+			continue
+		}
+		cands = append(cands, f[0])
+	}
+	// ترجیح سرویسی که روی همان پورت BaseURL گوش می‌دهد
+	for _, u := range cands {
+		es, _ := exec.Command("systemctl", "show", "-p", "ExecStart", u).Output()
+		if port != "" && strings.Contains(string(es), ":"+port) {
+			return u
+		}
+	}
+	if len(cands) > 0 {
+		return cands[0]
+	}
+	return ""
+}
+
+func (e *ocEnv) authPath() string {
+	return filepath.Join(e.DataDir, "auth.json")
+}
+
+func (e *ocEnv) configPath() string {
+	for _, name := range []string{"opencode.jsonc", "opencode.json"} {
+		p := filepath.Join(e.ConfigDir, name)
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return filepath.Join(e.ConfigDir, "opencode.jsonc")
+}
+
+// readAuth خواندن auth.json
+func (e *ocEnv) readAuth() (map[string]map[string]string, error) {
+	out := map[string]map[string]string{}
+	b, err := os.ReadFile(e.authPath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return out, nil
+		}
+		return out, err
+	}
+	if err := json.Unmarshal(b, &out); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
+// providersConfigured پروایدرهایی که کلید دارند
+func (e *ocEnv) providersConfigured() []string {
+	seen := map[string]bool{}
+	var ids []string
+	m, err := e.readAuth()
+	if err == nil {
+		for id, v := range m {
+			if v == nil {
+				continue
+			}
+			if k, _ := v["key"]; k != "" {
+				seen[id] = true
+				ids = append(ids, id)
+			}
+		}
+	}
+	for _, cand := range []string{"deepseek", "openai", "anthropic", "google", "xai", "openrouter", "mistral", "groq"} {
+		if !seen[cand] && os.Getenv(envVarFor(cand)) != "" {
+			seen[cand] = true
+			ids = append(ids, cand)
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func (e *ocEnv) hasKey(provider string) bool {
+	m, err := e.readAuth()
+	if err == nil {
+		if v, ok := m[provider]; ok && v != nil && v["key"] != "" {
+			return true
+		}
+	}
+	// بعضی‌ها کلید را با متغیر محیطی می‌دهند
+	if envVar := envVarFor(provider); envVar != "" {
+		if os.Getenv(envVar) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func envVarFor(provider string) string {
+	m := map[string]string{
+		"deepseek":   "DEEPSEEK_API_KEY",
+		"openai":     "OPENAI_API_KEY",
+		"anthropic":  "ANTHROPIC_API_KEY",
+		"google":     "GOOGLE_GENERATIVE_AI_API_KEY",
+		"xai":        "XAI_API_KEY",
+		"openrouter": "OPENROUTER_API_KEY",
+		"mistral":    "MISTRAL_API_KEY",
+		"groq":       "GROQ_API_KEY",
+		"github":     "GITHUB_TOKEN",
+	}
+	return m[provider]
+}
+
+// addAuthKey افزودن/به‌روزرسانی کلید یک پروایدر
+func (e *ocEnv) addAuthKey(provider, key string) error {
+	m, err := e.readAuth()
+	if err != nil {
+		return err
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return fmt.Errorf("کلید خالی است")
+	}
+	entry := m[provider]
+	if entry == nil {
+		entry = map[string]string{}
+	}
+	entry["type"] = "api"
+	entry["key"] = key
+	m[provider] = entry
+	if err := os.MkdirAll(e.DataDir, 0o755); err != nil {
+		return err
+	}
+	b, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(e.authPath(), append(b, '\n'), 0o600); err != nil {
+		return err
+	}
+	return nil
+}
+
+// removeAuthKey حذف کلید یک پروایدر از auth.json
+func (e *ocEnv) removeAuthKey(provider string) error {
+	m, err := e.readAuth()
+	if err != nil {
+		return err
+	}
+	if _, ok := m[provider]; !ok {
+		return nil
+	}
+	delete(m, provider)
+	b, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(e.authPath(), append(b, '\n'), 0o600)
+}
+
+// currentModel خواندن مدل پیش‌فرض از کانفیگ
+func (e *ocEnv) currentModel() string {
+	b, err := os.ReadFile(e.configPath())
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		m := reModelVal.FindStringSubmatch(line)
+		if m != nil && m[2] == "model" && m[3] != "" {
+			return m[3]
+		}
+	}
+	return ""
+}
+
+// setModel تنظیم model و small_model در کانفیگ (با حفظ بقیه فایل)
+func (e *ocEnv) setModel(full string) error {
+	full = strings.TrimSpace(full)
+	if !strings.Contains(full, "/") {
+		return fmt.Errorf("قالب مدل باید provider/model باشد، مثل deepseek/deepseek-v4-flash")
+	}
+	path := e.configPath()
+	var lines []string
+	if b, err := os.ReadFile(path); err == nil {
+		lines = strings.Split(string(b), "\n")
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.MkdirAll(e.ConfigDir, 0o755); err != nil {
+		return err
+	}
+	writeModel := func(l, key, val string) string {
+		if m := reModelLine.FindStringSubmatch(l); m != nil && m[2] == key {
+			return fmt.Sprintf("%s\"%s\": \"%s\"%s", m[1], key, val, m[3])
+		}
+		return l
+	}
+	var out []string
+	haveModel, haveSmall := false, false
+	insertedSchema := false
+	for _, l := range lines {
+		switch {
+		case reModelLine.MatchString(l) && strings.Contains(l, `"model"`):
+			out = append(out, writeModel(l, "model", full))
+			haveModel = true
+			continue
+		case reModelLine.MatchString(l) && strings.Contains(l, `"small_model"`):
+			out = append(out, writeModel(l, "small_model", full))
+			haveSmall = true
+			continue
+		case reSchema.MatchString(l) && !insertedSchema && !haveModel && !haveSmall:
+			out = append(out, l)
+			out = append(out, fmt.Sprintf("  \"model\": \"%s\",", full))
+			out = append(out, fmt.Sprintf("  \"small_model\": \"%s\",", full))
+			insertedSchema = true
+			haveModel, haveSmall = true, true
+			continue
+		}
+		out = append(out, l)
+	}
+	if !haveModel || !haveSmall {
+		// هیچ خط model/schema ای نبود؛ به‌صورت امن به انتهای فایل (قبل از براکت بستن) اضافه کن
+		var tail []string
+		if len(out) > 0 && strings.TrimSpace(out[len(out)-1]) == "}" {
+			tail = append(tail, out[len(out)-1])
+			out = out[:len(out)-1]
+		}
+		if !haveModel {
+			out = append(out, fmt.Sprintf("  \"model\": \"%s\",", full))
+		}
+		if !haveSmall {
+			out = append(out, fmt.Sprintf("  \"small_model\": \"%s\",", full))
+		}
+		out = append(out, tail...)
+	}
+	return os.WriteFile(path, []byte(strings.Join(out, "\n")+"\n"), 0o644)
+}
+
+// restart ری‌استارت سرویس systemd سرور opencode
+func (e *ocEnv) restart() error {
+	if e.Service == "" {
+		return fmt.Errorf("سرویس opencode پیدا نشد؛ سشن را با /new عوض کن یا سرور را دستی ری‌استارت کن")
+	}
+	out, err := exec.Command("systemctl", "restart", e.Service).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ری‌استارت %s ناموفق بود: %v %s", e.Service, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// agentDirs لیست agentهای سفارشی تعریف‌شده در پوشه کانفیگ
+func (e *ocEnv) customAgents() []string {
+	dir := filepath.Join(e.ConfigDir, "agent")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, en := range entries {
+		name := en.Name()
+		if en.IsDir() || strings.HasPrefix(name, ".") {
+			continue
+		}
+		if strings.HasSuffix(name, ".md") {
+			name = strings.TrimSuffix(name, ".md")
+		}
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}

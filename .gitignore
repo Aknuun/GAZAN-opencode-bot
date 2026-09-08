@@ -1,0 +1,20 @@
+# secrets / runtime
+.env
+state.json
+*.log
+*.bak
+*.bak-*
+
+# build artifacts
+/opencode-tg-bot
+*.exe
+
+# uploads & downloads
+/downloads/
+
+# editor / os
+.DS_Store
+*.swp
+
+# local runtime data
+/.local/

@@ -1,0 +1,164 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+)
+
+type OCClient struct {
+	base   string
+	agent  string
+	client *http.Client
+}
+
+func newOCClient(base, agent string) *OCClient {
+	return &OCClient{
+		base:  strings.TrimRight(base, "/"),
+		agent: agent,
+		client: &http.Client{
+			Timeout: 30 * time.Second,
+		},
+	}
+}
+
+type OCSession struct {
+	ID        string  `json:"id"`
+	Slug      string  `json:"slug"`
+	Title     string  `json:"title"`
+	Directory string  `json:"directory"`
+	Cost      float64 `json:"cost"`
+	Tokens    struct {
+		Input  int `json:"input"`
+		Output int `json:"output"`
+	} `json:"tokens"`
+	Summary struct {
+		Files int `json:"files"`
+	} `json:"summary"`
+	ModelID string `json:"modelID"`
+	Time    struct {
+		Created int64 `json:"created"`
+		Updated int64 `json:"updated"`
+	} `json:"time"`
+}
+
+type OCPart struct {
+	Type  string       `json:"type"`
+	Text  string       `json:"text"`
+	Tool  string       `json:"tool"`
+	State *OCPartState `json:"state"`
+}
+
+type OCPartState struct {
+	Status string         `json:"status"`
+	Title  string         `json:"title"`
+	Input  map[string]any `json:"input"`
+}
+
+type OCMessage struct {
+	Info struct {
+		ID        string `json:"id"`
+		Role      string `json:"role"`
+		SessionID string `json:"sessionID"`
+		ModelID   string `json:"modelID"`
+		Finish    string `json:"finish"`
+	} `json:"info"`
+	Parts []OCPart `json:"parts"`
+}
+
+func (c *OCClient) doJSON(ctx context.Context, method, path string, body any, out any) error {
+	var rd io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		rd = bytes.NewReader(b)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.base+path, rd)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2000))
+		return fmt.Errorf("opencode %s %s: %s %s", method, path, resp.Status, string(b))
+	}
+	if out == nil {
+		io.Copy(io.Discard, resp.Body)
+		return nil
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+func (c *OCClient) CreateSession(ctx context.Context) (*OCSession, error) {
+	var s OCSession
+	err := c.doJSON(ctx, http.MethodPost, "/session", map[string]any{}, &s)
+	if err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
+func (c *OCClient) ListSessions(ctx context.Context, limit int) ([]OCSession, error) {
+	if limit <= 0 {
+		limit = 5
+	}
+	var list []OCSession
+	if err := c.doJSON(ctx, http.MethodGet, "/session", nil, &list); err != nil {
+		return nil, err
+	}
+	if len(list) > limit {
+		list = list[:limit]
+	}
+	return list, nil
+}
+
+func (c *OCClient) GetSession(ctx context.Context, id string) (*OCSession, error) {
+	var s OCSession
+	if err := c.doJSON(ctx, http.MethodGet, "/session/"+url.PathEscape(id), nil, &s); err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
+func (c *OCClient) PromptAsync(ctx context.Context, sessionID, prompt, agent string) error {
+	if agent == "" {
+		agent = c.agent
+	}
+	body := map[string]any{
+		"agent": agent,
+		"parts": []map[string]any{{"type": "text", "text": prompt}},
+	}
+	return c.doJSON(ctx, http.MethodPost,
+		"/session/"+url.PathEscape(sessionID)+"/prompt_async", body, nil)
+}
+
+func (c *OCClient) LastMessage(ctx context.Context, sessionID string) (*OCMessage, error) {
+	var list []OCMessage
+	err := c.doJSON(ctx, http.MethodGet,
+		"/session/"+url.PathEscape(sessionID)+"/message?limit=1", nil, &list)
+	if err != nil {
+		return nil, err
+	}
+	if len(list) == 0 {
+		return nil, nil
+	}
+	return &list[0], nil
+}
+
+func (c *OCClient) Abort(ctx context.Context, sessionID string) error {
+	return c.doJSON(ctx, http.MethodPost,
+		"/session/"+url.PathEscape(sessionID)+"/abort", nil, nil)
+}
