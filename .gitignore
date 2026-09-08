@@ -1,6 +1,7 @@
 # secrets / runtime
 .env
 state.json
+catalog-models.json
 *.log
 *.bak
 *.bak-*

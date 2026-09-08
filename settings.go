@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
@@ -39,6 +38,8 @@ func (b *Bot) providerLabel(env *ocEnv, id string) string {
 	label := id
 	if p, ok := presetByID(id); ok {
 		label = p.label
+	} else if pr, ok := b.cat.provider(id); ok {
+		label = pr.Name
 	}
 	if env.hasKey(id) {
 		return label + " ✅"
@@ -153,9 +154,9 @@ func (b *Bot) onSettingsCallback(userID, chatID int64, msgID int, data string) {
 	env := b.envFor()
 	switch {
 	case data == "s:model":
-		b.showProviderPicker(chatID, msgID, "model")
+		b.openProvFull(chatID, msgID, "model", 0)
 	case data == "s:key":
-		b.showProviderPicker(chatID, msgID, "key")
+		b.openProvFull(chatID, msgID, "key", 0)
 	case data == "s:ag":
 		b.showAgentPicker(chatID, msgID)
 	case data == "s:restart":
@@ -178,12 +179,35 @@ func (b *Bot) onSettingsCallback(userID, chatID int64, msgID int, data string) {
 		}
 		switch parts[1] {
 		case "pv":
-			// s:pv:<pid>
-			b.showModelsFor(chatID, msgID, parts[2])
+			// s:pv:<pid> — انتخاب پروایدر از فهرست کامل
+			b.showModelsFor(chatID, msgID, parts[2], "")
+		case "ps":
+			// s:ps:<pid> — انتخاب پروایدر از نتیجهٔ جست‌وجو (با همان فیلتر)
+			b.openSearchModel(chatID, msgID, parts[2])
+		case "pl":
+			// s:pl:<mode>:<page> — صفحه‌بندی فهرست کامل پروایدرها
+			if len(parts) == 4 {
+				b.openProvFull(chatID, msgID, parts[2], parsePage(parts[3]))
+			}
+		case "sp":
+			// s:sp:<page> — صفحه‌بندی نتایج جست‌وجو
+			b.openProvSearch(chatID, msgID, parsePage(parts[2]))
+		case "ml":
+			// s:ml:<page> — صفحه‌بندی مدل‌های پروایدر
+			b.renderModelsScreen(chatID, msgID, parsePage(parts[2]))
+		case "q":
+			// s:q:<mode> — شروع جست‌وجوی پروایدر/مدل
+			b.askProviderSearch(chatID, msgID, parts[2])
+		case "mf":
+			// s:mf:<pid> — فیلتر مدل‌های یک پروایدر
+			b.askFilterModels(chatID, msgID, parts[2])
+		case "keyprov":
+			// s:keyprov:<pid> — ست کردن کلید همان پروایدر
+			b.requestKey(chatID, msgID, parts[2])
 		case "sel":
 			// s:sel:<pid>:<idx>
 			if len(parts) == 4 {
-				b.applyPresetModelIdx(chatID, msgID, parts[2], parts[3])
+				b.pickModel(chatID, msgID, parts[2], parts[3])
 			}
 		case "mm":
 			b.requestPendingModel(chatID, msgID, parts[2])
@@ -197,91 +221,9 @@ func (b *Bot) onSettingsCallback(userID, chatID int64, msgID int, data string) {
 	}
 }
 
-func (b *Bot) showProviderPicker(chatID int64, msgID int, mode string) {
-	env := b.envFor()
-	var sb strings.Builder
-	switch mode {
-	case "key":
-		sb.WriteString("🔑 برای کدام پروایدر کلید API می‌گذاری؟\nبعد از انتخاب، کلید را تایپ و ارسال کن.")
-	case "krm":
-		sb.WriteString("🗑 کلید کدام پروایدر حذف شود؟")
-	default:
-		sb.WriteString("🧠 مدل کدام پروایدر را می‌خواهی؟")
-	}
-	sb.WriteString("\n\n(✅ یعنی کلیدش ست شده)")
-	var rows [][]tgbotapi.InlineKeyboardButton
-	var row []tgbotapi.InlineKeyboardButton
-	add := func(id string) {
-		tok := "s:pv:" + id
-		switch mode {
-		case "key":
-			tok = "s:kp:" + id
-		case "krm":
-			tok = "s:krm:" + id
-		}
-		row = append(row, inlineBtn(b.providerLabel(env, id), tok))
-		if len(row) == 2 {
-			rows = append(rows, row)
-			row = nil
-		}
-	}
-	for _, p := range presetProviders {
-		add(p.id)
-	}
-	for _, pid := range env.providersConfigured() {
-		if _, isPreset := presetByID(pid); !isPreset {
-			add(pid)
-		}
-	}
-	if len(row) > 0 {
-		rows = append(rows, row)
-	}
-	if mode == "model" {
-		rows = append(rows, []tgbotapi.InlineKeyboardButton{inlineBtn("✍️ تایپ دستی (provider/model)", "s:mm:__manual__")})
-	}
-	rows = append(rows, []tgbotapi.InlineKeyboardButton{inlineBtn("🔙", "s:main")})
-	b.editSettings(chatID, msgID, sb.String(), rowsOf(rows...))
-}
-
-func (b *Bot) showModelsFor(chatID int64, msgID int, pid string) {
-	env := b.envFor()
-	var sb strings.Builder
-	var rows [][]tgbotapi.InlineKeyboardButton
-	if p, ok := presetByID(pid); ok {
-		sb.WriteString("🧠 مدل‌های <b>" + p.label + "</b>:")
-		for i, m := range p.models {
-			label := m
-			if env.currentModel() == pid+"/"+m {
-				label += " ← فعلی"
-			}
-			rows = append(rows, []tgbotapi.InlineKeyboardButton{inlineBtn(label, "s:sel:"+pid+":"+strconv.Itoa(i))})
-		}
-	} else {
-		sb.WriteString("🧠 پروایدر <b>" + pid + "</b> در لیست پیشنهادی نیست؛ مدل را دستی تایپ کن.")
-	}
-	sb.WriteString("\n\nاگر مدل‌ات در لیست نبود، «تایپ دستی» را بزن.")
-	rows = append(rows,
-		[]tgbotapi.InlineKeyboardButton{inlineBtn("✍️ تایپ دستی", "s:mm:"+pid)},
-		[]tgbotapi.InlineKeyboardButton{inlineBtn("🔙", "s:model")},
-	)
-	b.editSettings(chatID, msgID, sb.String(), rowsOf(rows...))
-}
-
-func (b *Bot) applyPresetModelIdx(chatID int64, msgID int, pid, idxStr string) {
-	idx, err := strconv.Atoi(idxStr)
-	if err != nil {
-		return
-	}
-	p, ok := presetByID(pid)
-	if !ok || idx < 0 || idx >= len(p.models) {
-		return
-	}
-	b.applyModel(chatID, msgID, pid+"/"+p.models[idx])
-}
-
 func (b *Bot) requestPendingModel(chatID int64, msgID int, pid string) {
 	env := b.envFor()
-	text := "✍️ نام کامل مدل را بفرست.\nقالب: <code>provider/model</code>\nمثل: <code>deepseek/deepseek-v4-flash</code>"
+	text := "✍️ مدل را بفرست.\nقالب کامل: <code>provider/model</code> (مثل <code>deepseek/deepseek-v4-flash</code>)\nیا اگر فقط اسمش را می‌دانی (مثل Qwen) بنویس تا در کاتالوگ بگردم."
 	if pid != "" && pid != "__manual__" {
 		label := pid
 		if p, ok := presetByID(pid); ok {
@@ -291,6 +233,7 @@ func (b *Bot) requestPendingModel(chatID int64, msgID int, pid string) {
 		if p, ok := presetByID(pid); ok && len(p.models) > 0 {
 			text += "\nمثلاً: <code>" + pid + "/" + p.models[0] + "</code>"
 		}
+		text += "\n(یا فقط بخشی از نامش را بنویس تا بگردم)"
 	}
 	if cur := env.currentModel(); cur != "" {
 		text += "\n\nمدل فعلی: <code>" + cur + "</code>"
@@ -354,9 +297,9 @@ func (b *Bot) applyModel(chatID int64, msgID int, full string) {
 	pid := strings.SplitN(full, "/", 2)[0]
 	if !env.hasKey(pid) {
 		b.editSettings(chatID, msgID,
-			"✅ مدل روی <code>"+full+"</code> ست شد؛ ولی پروایدر <code>"+pid+"</code> کلید API ندارد.\nاز «🔑 کلید API» کلید را بفرست.",
+			"✅ مدل روی <code>"+full+"</code> ست شد؛ ولی پروایدر <code>"+pid+"</code> کلید API ندارد.",
 			rowsOf(
-				[]tgbotapi.InlineKeyboardButton{inlineBtn("🔑 ست کردن کلید", "s:key")},
+				[]tgbotapi.InlineKeyboardButton{inlineBtn("🔑 ست کردن کلید "+pid, "s:keyprov:"+pid)},
 				[]tgbotapi.InlineKeyboardButton{inlineBtn("🔙", "s:main")},
 			))
 		b.restartAfter(chatID)
@@ -436,16 +379,36 @@ func (b *Bot) handlePending(userID, chatID int64, pending, text string) {
 		b.send(chatID, "✅ نام نشست عوض شد:\n"+text)
 	case "model":
 		full := text
-		if !strings.Contains(full, "/") && arg != "" && arg != "__manual__" {
-			full = arg + "/" + text
-		}
 		if !strings.Contains(full, "/") {
-			b.send(chatID, "قالب باید provider/model باشد (مثل deepseek/deepseek-v4-flash).")
-			return
+			if arg != "" && arg != "__manual__" {
+				full = arg + "/" + text
+			} else {
+				// فقط اسم مدل/پروایدر بود؛ به‌جای خطا در کاتالوگ بگرد
+				b.doSearch(chatID, text, "model")
+				return
+			}
 		}
 		msg := tgbotapi.NewMessage(chatID, "⏳ در حال تنظیم…")
 		m, _ := b.api.Send(msg)
 		b.applyModel(chatID, m.MessageID, full)
+	case "ps":
+		// جست‌وجوی پروایدر/مدل؛ arg = حالت (model|key)
+		if arg == "" {
+			b.doSearch(chatID, text, "model")
+		} else {
+			b.doSearch(chatID, text, arg)
+		}
+	case "mf":
+		// فیلتر مدل‌های یک پروایدر
+		if arg == "" {
+			b.send(chatID, "پروایدر مشخص نیست.")
+			return
+		}
+		if len([]rune(text)) < 2 {
+			b.send(chatID, "برای فیلتر حداقل ۲ حرف بنویس (مثلاً qwen).")
+			return
+		}
+		b.showModelsFor(chatID, 0, arg, text)
 	case "key":
 		pid := arg
 		if pid == "" {

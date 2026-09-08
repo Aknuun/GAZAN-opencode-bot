@@ -84,6 +84,10 @@ type Bot struct {
 	qmu  sync.Mutex
 	qmap map[string]*pendingQ // توکن کوتاه → سؤال در انتظار پاسخ
 	qseq int64
+
+	cat *modelCatalog       // کاتالوگ مدل‌ها (models.dev) با کش
+	mlc map[int64]modelsCtx // صفحهٔ مدل‌های بازشده برای هر چت
+	scx map[int64]searchCtx // نتایج جست‌وجوی باز برای هر چت
 }
 
 type costInfo struct {
@@ -100,6 +104,9 @@ func newBot(cfg *Config, api *tgbotapi.BotAPI) *Bot {
 		runs:   map[string]*runCtl{},
 		cost:   map[int64]costInfo{},
 		qmap:   map[string]*pendingQ{},
+		cat:    newModelCatalog(filepath.Join(filepath.Dir(cfg.StateFile), "catalog-models.json")),
+		mlc:    map[int64]modelsCtx{},
+		scx:    map[int64]searchCtx{},
 	}
 }
 

@@ -24,6 +24,12 @@ func main() {
 	if err := bot.loadStates(); err != nil {
 		log.Printf("هشدار: بارگذاری state ناموفق: %v", err)
 	}
+	// پیش‌بارگذاری کاتالوگ مدل‌ها تا اولین باز شدن تنظیمات معطل نکند
+	go func() {
+		if _, err := bot.cat.providers(); err != nil {
+			log.Printf("هشدار: پیش‌بارگذاری کاتالوگ مدل‌ها ناموفق: %v", err)
+		}
+	}()
 
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = cfg.PollMs
