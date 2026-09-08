@@ -44,6 +44,7 @@ const helpText = `ربات کنترل opencode روی سرور
 
 const (
 	btnStatus    = "📊 وضعیت و هزینه"
+	btnModel     = "🧠 مدل فعال"
 	btnSettings  = "⚙️ تنظیمات"
 	btnSessions  = "🗂 نشست‌ها"
 	maxFileBytes = 30 << 20
@@ -375,6 +376,9 @@ func (b *Bot) replyKeyboard(chatID int64) tgbotapi.ReplyKeyboardMarkup {
 				{Text: btnSettings},
 				{Text: btnSessions},
 			},
+			{
+				{Text: btnModel},
+			},
 		},
 	}
 }
@@ -539,6 +543,9 @@ func (b *Bot) Handle(upd tgbotapi.Update) {
 		return
 	case btnSessions:
 		b.openSessions(userID, chatID, 0)
+		return
+	case btnModel:
+		b.showModelInfo(userID, chatID)
 		return
 	}
 	if st := b.stateFor(userID, chatID); st.Pending != "" {
@@ -775,6 +782,33 @@ func (b *Bot) showStatus(userID, chatID int64) {
 	msg += fmt.Sprintf("جمع توکن: %s\n", abbrev(s.Tokens.Input+s.Tokens.Output))
 	msg += fmt.Sprintf("هزینه: $%.4f", s.Cost)
 	b.send(chatID, msg)
+}
+
+func (b *Bot) showModelInfo(userID, chatID int64) {
+	env := b.envFor()
+	model := env.currentModel()
+	agent := b.agentFor(userID)
+	if model == "" {
+		b.send(chatID, "سلام! 👋 من ربات روی سرور opencode هستم.\nهنوز مدلی ست نشده. با ⚙️ تنظیمات یک مدل انتخاب کن.")
+		return
+	}
+	msg := "سلام! 👋 من ربات روی سرور opencode هستم.\n\n"
+	msg += "🧠 مدل فعلی: " + model + "\n"
+	msg += "🤖 agent: " + agent + "\n\n"
+	msg += "این مدلی است که به پیام‌هایت پاسخ می‌دهد."
+	b.send(chatID, msg)
+}
+
+// abortAllRuns همهٔ اجرای‌های فعال را متوقف می‌کند (بعد از تغییر مدل)
+// بعد از ری‌استارت سرور، تمام اجرای‌های قبلی بی‌اعتبار می‌شوند
+func (b *Bot) abortAllRuns() {
+	b.mu.Lock()
+	for id, r := range b.runs {
+		r.cancel()
+		close(r.done)
+		delete(b.runs, id)
+	}
+	b.mu.Unlock()
 }
 
 // ---------- ارسال پرامپت و اجرا ----------

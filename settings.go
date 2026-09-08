@@ -10,6 +10,35 @@ import (
 
 // ---------- پروایدرهای پیشنهادی ----------
 
+// paidProviders: این‌ها پولی هستند و علامت نارنجی می‌گیرند
+var paidProviders = map[string]bool{
+	"anthropic": true,
+	"openai":    true,
+	"google":    true,
+	"xai":       true,
+	"openrouter": true,
+	"mistral":   true,
+	"groq":      true,
+	"together":  true,
+	"sambanova": true,
+	"nvidia":    true,
+	"deepinfra": true,
+	"perplexity": true,
+	"fireworks": true,
+	"cerebras":  true,
+	"bedrock":   true,
+	"vertex":    true,
+	"cloudflare":true,
+	"replicate": true,
+	"ai21":      true,
+	"cohere":    true,
+	"jina":      true,
+}
+
+func isPaidProvider(pid string) bool {
+	return paidProviders[pid]
+}
+
 type presetProvider struct {
 	id     string
 	label  string
@@ -42,6 +71,9 @@ func (b *Bot) providerLabel(env *ocEnv, id string) string {
 		label = pr.Name
 	}
 	if env.hasKey(id) {
+		if isPaidProvider(id) {
+			return label + " 🟡"
+		}
 		return label + " ✅"
 	}
 	return label
@@ -315,7 +347,9 @@ func (b *Bot) restartAfter(chatID int64) {
 		b.send(chatID, "⚠️ ری‌استارت خودکار نشد؛ /new بزن یا سرور را دستی ری‌استارت کن.")
 		return
 	}
-	b.send(chatID, "✅ سرور opencode ری‌استارت شد و تغییرات اعمال شد.")
+	b.send(chatID, "✅ سرور opencode ری‌استارت شد و تغییرات اعمال شد.\n(نشست‌های قبلی مدل‌شان عوض نشده؛ برای استفاده از مدل جدید /new بزن.)")
+	// بعد از ری‌استارت، اجرای‌های قدیمی باید ریست شوند
+	b.abortAllRuns()
 }
 
 // ---------- pending (تایپ متنی) ----------
