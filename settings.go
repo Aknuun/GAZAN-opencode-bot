@@ -408,6 +408,24 @@ func (b *Bot) handlePending(userID, chatID int64, pending, text string) {
 		arg = parts[1]
 	}
 	switch kind {
+	case "rn":
+		// تغییر نام (عنوان فارسی) یک نشست
+		sid := arg
+		if sid == "" {
+			b.send(chatID, "نشست مشخص نیست.")
+			return
+		}
+		b.mu.Lock()
+		st2 := b.states[userID]
+		if st2 != nil {
+			if st2.Labels == nil {
+				st2.Labels = map[string]string{}
+			}
+			st2.Labels[sid] = text
+			b.saveStates()
+		}
+		b.mu.Unlock()
+		b.send(chatID, "✅ نام نشست عوض شد:\n"+text)
 	case "model":
 		full := text
 		if !strings.Contains(full, "/") && arg != "" && arg != "__manual__" {

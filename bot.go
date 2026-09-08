@@ -51,12 +51,13 @@ const (
 )
 
 type UserState struct {
-	UserID    int64    `json:"user_id"`
-	ChatID    int64    `json:"chat_id"`
-	SessionID string   `json:"session_id,omitempty"`
-	Sessions  []string `json:"sessions,omitempty"`
-	Agent     string   `json:"agent,omitempty"`
-	Pending   string   `json:"pending,omitempty"`
+	UserID    int64             `json:"user_id"`
+	ChatID    int64             `json:"chat_id"`
+	SessionID string            `json:"session_id,omitempty"`
+	Sessions  []string          `json:"sessions,omitempty"`
+	Labels    map[string]string `json:"labels,omitempty"` // نام فارسی نشست‌ها
+	Agent     string            `json:"agent,omitempty"`
+	Pending   string            `json:"pending,omitempty"`
 }
 
 // runCtl کنترل اجرای هم‌زمان یک نشست
@@ -103,7 +104,49 @@ func (b *Bot) loadStates() error {
 		}
 		return err
 	}
-	return json.Unmarshal(data, &b.states)
+	if err := json.Unmarshal(data, &b.states); err != nil {
+		return err
+	}
+	b.normalizeStates()
+	return nil
+}
+
+// normalizeStates برچسب‌های پیش‌فرض برای نشست‌های قدیمی/بدون نام می‌سازد
+func (b *Bot) normalizeStates() {
+	for _, st := range b.states {
+		if st.Labels == nil {
+			st.Labels = map[string]string{}
+		}
+		// مطمئن شو نشست فعال در لیست هست
+		if st.SessionID != "" {
+			st.Sessions = addSessionID(st.Sessions, st.SessionID)
+		}
+		for i, sid := range st.Sessions {
+			if st.Labels[sid] == "" {
+				st.Labels[sid] = defaultSessionName(i + 1)
+			}
+		}
+	}
+	b.saveStates()
+}
+
+func defaultSessionName(n int) string {
+	return fmt.Sprintf("نشست %d", n)
+}
+
+// sessionLabel نام نمایشی نشست
+func (b *Bot) sessionLabel(st *UserState, sid string) string {
+	if st.Labels != nil {
+		if l := st.Labels[sid]; l != "" {
+			return l
+		}
+	}
+	for i, s := range st.Sessions {
+		if s == sid {
+			return defaultSessionName(i + 1)
+		}
+	}
+	return shortSID(sid)
 }
 
 func (b *Bot) saveStates() error {
@@ -144,8 +187,23 @@ func (b *Bot) setSession(userID int64, id string) {
 	if st == nil {
 		return
 	}
+	had := false
+	for _, s := range st.Sessions {
+		if s == id {
+			had = true
+			break
+		}
+	}
+	if !had {
+		st.Sessions = append(st.Sessions, id)
+	}
 	st.SessionID = id
-	st.Sessions = addSessionID(st.Sessions, id)
+	if st.Labels == nil {
+		st.Labels = map[string]string{}
+	}
+	if st.Labels[id] == "" {
+		st.Labels[id] = defaultSessionName(len(st.Sessions))
+	}
 	b.saveStates()
 }
 
@@ -543,7 +601,8 @@ func (b *Bot) handleCommand(upd tgbotapi.Update, text string) {
 			return
 		}
 		b.setSession(userID, arg)
-		b.send(chatID, "نشست فعال شد: "+arg)
+		st := b.stateFor(userID, chatID)
+		b.send(chatID, "نشست فعال شد:\n"+b.sessionLabel(st, arg)+"\n"+arg)
 	case "/list":
 		b.listSessions(chatID)
 	case "/status":
@@ -577,7 +636,8 @@ func (b *Bot) newSession(userID, chatID int64) {
 		return
 	}
 	b.setSession(userID, s.ID)
-	b.send(chatID, "نشست جدید ساخته و فعال شد.\n"+s.ID)
+	st := b.stateFor(userID, chatID)
+	b.send(chatID, "نشست جدید ساخته و فعال شد.\n"+b.sessionLabel(st, s.ID)+"\n"+s.ID)
 }
 
 func (b *Bot) listSessions(chatID int64) {
@@ -751,7 +811,7 @@ func shortSID(sid string) string {
 	return s
 }
 
-func (b *Bot) sessionLine(userID int64, st *UserState, sid string) string {
+func (b *Bot) sessionLine(st *UserState, sid string) string {
 	_, running := b.runFor(sid)
 	line := "`" + shortSID(sid) + "`"
 	if sid == st.SessionID {
@@ -765,31 +825,74 @@ func (b *Bot) sessionLine(userID int64, st *UserState, sid string) string {
 
 func (b *Bot) openSessions(userID, chatID int64, msgID int) {
 	st := b.stateFor(userID, chatID)
-	var sb strings.Builder
-	sb.WriteString("🗂 <b>نشست‌ها</b>\n\n")
-	if len(st.Sessions) == 0 {
-		if st.SessionID != "" {
-			st.Sessions = append(st.Sessions, st.SessionID)
+	b.mu.Lock()
+	if st.Labels == nil {
+		st.Labels = map[string]string{}
+	}
+	if st.SessionID != "" {
+		had := false
+		for _, s := range st.Sessions {
+			if s == st.SessionID {
+				had = true
+				break
+			}
+		}
+		if !had {
+			st.Sessions = append([]string{st.SessionID}, st.Sessions...)
 		}
 	}
-	if len(st.Sessions) == 0 {
+	for i, sid := range st.Sessions {
+		if st.Labels[sid] == "" {
+			st.Labels[sid] = defaultSessionName(i + 1)
+		}
+	}
+	var ids []string
+	ids = append(ids, st.Sessions...)
+	labels := map[string]string{}
+	for k, v := range st.Labels {
+		labels[k] = v
+	}
+	active := st.SessionID
+	b.saveStates()
+	b.mu.Unlock()
+
+	var sb strings.Builder
+	sb.WriteString("🗂 <b>نشست‌ها</b>\n\n")
+	if len(ids) == 0 {
 		sb.WriteString("هنوز نشستی نداری.\n«➕ نشست جدید» را بزن یا یک متن بفرست تا خودکار ساخته شود.")
 	} else {
-		for _, sid := range st.Sessions {
-			sb.WriteString(b.sessionLine(userID, st, sid) + "\n")
+		for i, sid := range ids {
+			_, running := b.runFor(sid)
+			num := fmt.Sprintf("%d.", i+1)
+			name := labels[sid]
+			if name == "" {
+				name = defaultSessionName(i + 1)
+			}
+			line := fmt.Sprintf("%s <b>%s</b>  `%s`", num, name, shortSID(sid))
+			if sid == active {
+				line += "  ← فعال"
+			}
+			if running {
+				line += "  ⏳"
+			}
+			sb.WriteString(line + "\n")
 		}
-		sb.WriteString("\nبا ➕ نشست جدید بساز؛ اجراهای در جریان قطع نمی‌شوند.")
+		sb.WriteString("\nبا ✏️ می‌توانی نام هر نشست را فارسی کنی. جابه‌جایی، اجرای در جریان را قطع نمی‌کند.")
 	}
 
 	var rows [][]tgbotapi.InlineKeyboardButton
-	for _, sid := range st.Sessions {
-		var row []tgbotapi.InlineKeyboardButton
-		row = append(row, inlineBtn("`"+shortSID(sid)+"`", "ss:noop"))
-		if sid != st.SessionID {
-			row = append(row, inlineBtn("➡️ برو", "ss:use:"+sid))
-		} else {
-			row = append(row, inlineBtn("✓ فعلی", "ss:noop"))
+	for i, sid := range ids {
+		label := labels[sid]
+		if label == "" {
+			label = defaultSessionName(i + 1)
 		}
+		row := []tgbotapi.InlineKeyboardButton{}
+		if sid == active {
+			row = append(row, inlineBtn("✓ "+clipHead(label, 18), "ss:noop"))
+		} else {
+			row = append(row, inlineBtn("➡️ "+clipHead(label, 18), "ss:use:"+sid))
+		}
+		row = append(row, inlineBtn("✏️", "ss:rn:"+sid))
 		if _, running := b.runFor(sid); running {
 			row = append(row, inlineBtn("⏹", "ss:stop:"+sid))
 		}
@@ -829,7 +932,8 @@ func (b *Bot) onSessionsCallback(userID, chatID int64, msgID int, data string) {
 			return
 		}
 		b.setSession(userID, s.ID)
-		b.send(chatID, "✅ نشست جدید ساخته و فعال شد:\n"+s.ID)
+		st := b.stateFor(userID, chatID)
+		b.send(chatID, "✅ نشست جدید ساخته و فعال شد:\n"+b.sessionLabel(st, s.ID)+"\n"+s.ID)
 		b.openSessions(userID, chatID, msgID)
 	default:
 		parts := strings.SplitN(data, ":", 3)
@@ -840,8 +944,14 @@ func (b *Bot) onSessionsCallback(userID, chatID int64, msgID int, data string) {
 		case "use":
 			sid := parts[2]
 			b.setSession(userID, sid)
-			b.send(chatID, "نشست فعال شد: "+sid)
+			st := b.stateFor(userID, chatID)
+			b.send(chatID, "✅ نشست فعال شد:\n"+b.sessionLabel(st, sid)+"\n"+sid)
 			b.openSessions(userID, chatID, msgID)
+		case "rn":
+			sid := parts[2]
+			b.setPendingByChat(chatID, "rn:"+sid)
+			edit := tgbotapi.NewEditMessageText(chatID, msgID, "✏️ نام جدید این نشست را بفرست (فارسی یا هر اسم دلخواه):")
+			b.api.Send(edit)
 		case "stop":
 			if b.stopRun(parts[2]) {
 				b.send(chatID, "اجرای نشست متوقف شد.")
