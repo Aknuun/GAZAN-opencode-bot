@@ -216,6 +216,46 @@ func addSessionID(list []string, id string) []string {
 	return append(list, id)
 }
 
+// setSessionLabel نام (عنوان موضوعی) نشست را به‌روز می‌کند
+func (b *Bot) setSessionLabel(userID int64, sid, label string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	st := b.states[userID]
+	if st == nil {
+		return
+	}
+	if st.Labels == nil {
+		st.Labels = map[string]string{}
+	}
+	st.Labels[sid] = label
+	b.saveStates()
+}
+
+// deleteSession حذف نشست از فهرست کاربر (+ توقف اجرا اگر در جریان باشد)
+func (b *Bot) deleteSession(userID int64, sid string) {
+	b.stopRun(sid)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	st := b.states[userID]
+	if st == nil {
+		return
+	}
+	var keep []string
+	for _, s := range st.Sessions {
+		if s != sid {
+			keep = append(keep, s)
+		}
+	}
+	st.Sessions = keep
+	if st.Labels != nil {
+		delete(st.Labels, sid)
+	}
+	if st.SessionID == sid {
+		st.SessionID = ""
+	}
+	b.saveStates()
+}
+
 func (b *Bot) setAgentValue(userID int64, agent string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -500,7 +540,7 @@ func (b *Bot) Handle(upd tgbotapi.Update) {
 		b.handleCommand(upd, text)
 		return
 	}
-	b.submitPrompt(userID, chatID, text)
+	b.submitPrompt(userID, chatID, text, autoLabel(text))
 }
 
 func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
@@ -530,15 +570,49 @@ func (b *Bot) handleFile(userID, chatID int64, fileID, fileName, caption string,
 		b.send(chatID, "دریافت فایل ناموفق بود: "+err.Error())
 		return
 	}
+	label := ""
 	prompt := strings.TrimSpace(caption)
 	if prompt == "" {
 		if isPhoto {
+			label = "📷 تحلیل تصویر"
 			prompt = "این تصویر پیوست‌شده را تحلیل کن و نتیجه را گزارش بده."
 		} else {
+			label = "📄 بررسی " + fileBase(fileName)
 			prompt = "محتوای این فایل پیوست‌شده را بررسی کن و خلاصه یا پاسخ مناسب بده."
 		}
+	} else {
+		label = autoLabel(prompt)
 	}
-	b.submitPrompt(userID, chatID, prompt+"\n\nفایل پیوست: "+path)
+	if label == "" {
+		label = autoLabel(prompt)
+	}
+	b.submitPrompt(userID, chatID, prompt+"\n\nفایل پیوست: "+path, label)
+}
+
+func fileBase(name string) string {
+	name = filepath.Base(name)
+	if len([]rune(name)) > 24 {
+		name = string([]rune(name)[:24]) + "…"
+	}
+	return name
+}
+
+// autoLabel نام خودکار نشست از روی موضوع آخرین پیام کاربر
+func autoLabel(prompt string) string {
+	p := strings.TrimSpace(prompt)
+	if i := strings.Index(p, "\n\nفایل پیوست:"); i > 0 {
+		p = strings.TrimSpace(p[:i])
+	}
+	p = strings.Join(strings.Fields(p), " ")
+	r := []rune(p)
+	if len(r) == 0 {
+		return "گفتگو"
+	}
+	const max = 34
+	if len(r) > max {
+		return string(r[:max]) + "…"
+	}
+	return p
 }
 
 func (b *Bot) download(fileID, fileName string) (string, error) {
@@ -689,7 +763,7 @@ func (b *Bot) showStatus(userID, chatID int64) {
 
 // ---------- ارسال پرامپت و اجرا ----------
 
-func (b *Bot) submitPrompt(userID, chatID int64, prompt string) {
+func (b *Bot) submitPrompt(userID, chatID int64, prompt, label string) {
 	if !b.ocReady() {
 		b.send(chatID, b.ocSetupHint())
 		b.openSettings(userID, chatID)
@@ -714,6 +788,11 @@ func (b *Bot) submitPrompt(userID, chatID int64, prompt string) {
 		b.send(chatID, "این نشست الان در حال اجراست.\nبا دکمهٔ 🗂 نشست‌ها یک نشست دیگر بساز یا یکی از نشست‌ها را انتخاب کن تا هم‌زمان جلو برویم.")
 		return
 	}
+	// نام نشست از روی آخرین موضوع
+	if label == "" {
+		label = autoLabel(prompt)
+	}
+	b.setSessionLabel(userID, sid, label)
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &runCtl{SID: sid, UserID: userID, ChatID: chatID, cancel: cancel, done: make(chan struct{}), started: time.Now()}
 	b.addRun(r)
@@ -877,7 +956,7 @@ func (b *Bot) openSessions(userID, chatID int64, msgID int) {
 			}
 			sb.WriteString(line + "\n")
 		}
-		sb.WriteString("\nبا ✏️ می‌توانی نام هر نشست را فارسی کنی. جابه‌جایی، اجرای در جریان را قطع نمی‌کند.")
+		sb.WriteString("\nنام هر نشست خودکار از روی آخرین موضوعش است؛ با ✏️ دستی تغییرش بده و با 🗑 آن را ببند. جابه‌جایی، اجرای در جریان را قطع نمی‌کند.")
 	}
 
 	var rows [][]tgbotapi.InlineKeyboardButton
@@ -896,6 +975,7 @@ func (b *Bot) openSessions(userID, chatID int64, msgID int) {
 		if _, running := b.runFor(sid); running {
 			row = append(row, inlineBtn("⏹", "ss:stop:"+sid))
 		}
+		row = append(row, inlineBtn("🗑", "ss:del:"+sid))
 		rows = append(rows, row)
 	}
 	rows = append(rows, []tgbotapi.InlineKeyboardButton{inlineBtn("➕ نشست جدید", "ss:new")})
@@ -952,6 +1032,20 @@ func (b *Bot) onSessionsCallback(userID, chatID int64, msgID int, data string) {
 			b.setPendingByChat(chatID, "rn:"+sid)
 			edit := tgbotapi.NewEditMessageText(chatID, msgID, "✏️ نام جدید این نشست را بفرست (فارسی یا هر اسم دلخواه):")
 			b.api.Send(edit)
+		case "del":
+			sid := parts[2]
+			st := b.stateFor(userID, chatID)
+			edit := tgbotapi.NewEditMessageText(chatID, msgID, "🗑 نشست «"+b.sessionLabel(st, sid)+"» حذف شود؟\n(اگر اجرایی در جریان باشد متوقف می‌شود.)")
+			edit.ReplyMarkup = rowsOf(
+				[]tgbotapi.InlineKeyboardButton{inlineBtn("🗑 بله، حذف کن", "ss:delc:"+sid)},
+				[]tgbotapi.InlineKeyboardButton{inlineBtn("انصراف", "ss:refresh")},
+			)
+			b.api.Send(edit)
+		case "delc":
+			sid := parts[2]
+			b.deleteSession(userID, sid)
+			b.send(chatID, "🗑 نشست حذف شد.")
+			b.openSessions(userID, chatID, msgID)
 		case "stop":
 			if b.stopRun(parts[2]) {
 				b.send(chatID, "اجرای نشست متوقف شد.")
