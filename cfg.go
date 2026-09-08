@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -28,7 +29,7 @@ var (
 
 func newOCEnv(cfg *Config) *ocEnv {
 	e := &ocEnv{Port: portOf(cfg.BaseURL), Service: cfg.OCService}
-	home, _ := os.UserHomeDir()
+	home := homeDir()
 	xdgCfg := os.Getenv("XDG_CONFIG_HOME")
 	if xdgCfg == "" {
 		xdgCfg = filepath.Join(home, ".config")
@@ -51,6 +52,20 @@ func newOCEnv(cfg *Config) *ocEnv {
 		e.Service = detectOCService(e.Port)
 	}
 	return e
+}
+
+// homeDir مسیر خانه؛ در سرویس‌های systemd گاهی HOME ست نیست، پس به /root برمی‌گردیم
+func homeDir() string {
+	if h := os.Getenv("HOME"); h != "" {
+		return h
+	}
+	if u, err := user.Current(); err == nil && u.HomeDir != "" {
+		return u.HomeDir
+	}
+	if os.Geteuid() == 0 {
+		return "/root"
+	}
+	return "."
 }
 
 func portOf(raw string) string {

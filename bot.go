@@ -19,46 +19,64 @@ import (
 
 const helpText = `ربات کنترل opencode روی سرور
 
-ارسال پیام متنی / فایل => اجرای آن توسط opencode (در همان session)
+ارسال پیام متنی / فایل => اجرا روی نشستِ فعال فعلی
 
 دکمه‌های ثابت زیر پیام‌ها:
-📊 وضعیت و هزینه — مبلغ و توکنِ session فعلی
-⚙️ تنظیمات — تغییر agent، مدل/API و مدیریت سرور
-⏹ توقف عملیات — توقف اجرای فعلی و خالی کردن صف
+📊 وضعیت و هزینه — وضعیت نشست فعال
+⚙️ تنظیمات — مدل، کلید API و agent
+🗂 نشست‌ها — مدیریت نشست‌ها (ساخت/تعویض/توقف)
+
+نشست‌ها می‌توانند هم‌زمان اجرا شوند؛ تعویض نشست، اجرای در جریان را متوقف نمی‌کند.
 
 دستورات:
-/new         شروع گفتگوی جدید (session تازه)
-/use <id>    ادامهٔ یک session قبلی
-/list        فهرست sessionهای اخیر
-/status      جزئیات کامل وضعیت و هزینه
-/agent       نمایش/تغییر agent فعلی
-/queue       تعداد موارد در صف
-/flush       پاک کردن صف
-/cancel      توقف اجرای جاری
+/new         ساخت نشست جدید و رفتن به آن
+/use <id>    رفتن به نشست مشخص
+/sessions    باز کردن مدیریت نشست‌ها
+/list        فهرست نشست‌های اخیر سرور
+/status      جزئیات نشست فعال
+/agent       نمایش/تغییر agent
+/cancel      توقف اجرای نشست فعال
 /help        این راهنما
 
-حین اجرا پاسخ به‌صورت زنده به‌روز می‌شود؛ فرمان‌های جدید در صف می‌مانند.`
+حین اجرا پاسخ به‌صورت زنده به‌روز می‌شود؛ روی پیام «در حال انجام» دکمهٔ ⏹ توقف همان نشست است.`
 
 const (
 	btnStatus    = "📊 وضعیت و هزینه"
 	btnSettings  = "⚙️ تنظیمات"
-	btnStop      = "⏹ توقف عملیات"
+	btnSessions  = "🗂 نشست‌ها"
 	maxFileBytes = 30 << 20
+
+	// حداکثر اجرای هم‌زمان برای هر کاربر
+	maxConcurrentRuns = 6
 )
 
-var cancelTag = "cancel_run"
-
 type UserState struct {
-	UserID    int64  `json:"user_id"`
-	ChatID    int64  `json:"chat_id"`
-	SessionID string `json:"session_id,omitempty"`
-	Agent     string `json:"agent,omitempty"`
-	Pending   string `json:"pending,omitempty"`
+	UserID    int64    `json:"user_id"`
+	ChatID    int64    `json:"chat_id"`
+	SessionID string   `json:"session_id,omitempty"`
+	Sessions  []string `json:"sessions,omitempty"`
+	Agent     string   `json:"agent,omitempty"`
+	Pending   string   `json:"pending,omitempty"`
 }
 
-type queueItem struct {
-	ChatID int64
-	Prompt string
+// runCtl کنترل اجرای هم‌زمان یک نشست
+type runCtl struct {
+	SID     string
+	UserID  int64
+	ChatID  int64
+	cancel  context.CancelFunc
+	done    chan struct{}
+	started time.Time
+}
+
+type Bot struct {
+	cfg    *Config
+	oc     *OCClient
+	api    *tgbotapi.BotAPI
+	mu     sync.Mutex
+	states map[int64]*UserState
+	runs   map[string]*runCtl // کلید = نشست opencode
+	cost   map[int64]costInfo
 }
 
 type costInfo struct {
@@ -66,30 +84,14 @@ type costInfo struct {
 	label string
 }
 
-type Bot struct {
-	cfg        *Config
-	oc         *OCClient
-	api        *tgbotapi.BotAPI
-	mu         sync.Mutex
-	states     map[int64]*UserState
-	busy       map[int64]bool
-	cancels    map[int64]context.CancelFunc
-	queues     map[int64][]queueItem
-	processing map[int64]bool
-	costCache  map[int64]costInfo
-}
-
 func newBot(cfg *Config, api *tgbotapi.BotAPI) *Bot {
 	return &Bot{
-		cfg:        cfg,
-		oc:         newOCClient(cfg.BaseURL, cfg.Agent),
-		api:        api,
-		states:     map[int64]*UserState{},
-		busy:       map[int64]bool{},
-		cancels:    map[int64]context.CancelFunc{},
-		queues:     map[int64][]queueItem{},
-		processing: map[int64]bool{},
-		costCache:  map[int64]costInfo{},
+		cfg:    cfg,
+		oc:     newOCClient(cfg.BaseURL, cfg.Agent),
+		api:    api,
+		states: map[int64]*UserState{},
+		runs:   map[string]*runCtl{},
+		cost:   map[int64]costInfo{},
 	}
 }
 
@@ -129,23 +131,31 @@ func (b *Bot) stateFor(userID, chatID int64) *UserState {
 	return st
 }
 
-func (b *Bot) snapshot(userID int64) (string, string) {
+func (b *Bot) stateOf(userID int64) *UserState {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	st := b.states[userID]
-	if st == nil {
-		return "", ""
-	}
-	return st.SessionID, st.Agent
+	return b.states[userID]
 }
 
 func (b *Bot) setSession(userID int64, id string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if st := b.states[userID]; st != nil {
-		st.SessionID = id
-		b.saveStates()
+	st := b.states[userID]
+	if st == nil {
+		return
 	}
+	st.SessionID = id
+	st.Sessions = addSessionID(st.Sessions, id)
+	b.saveStates()
+}
+
+func addSessionID(list []string, id string) []string {
+	for _, s := range list {
+		if s == id {
+			return list
+		}
+	}
+	return append(list, id)
 }
 
 func (b *Bot) setAgentValue(userID int64, agent string) {
@@ -158,11 +168,11 @@ func (b *Bot) setAgentValue(userID int64, agent string) {
 }
 
 func (b *Bot) ensureSession(userID, chatID int64) (string, error) {
-	if sid, _ := b.snapshot(userID); sid != "" {
+	if st := b.stateOf(userID); st != nil && st.SessionID != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		if _, err := b.oc.GetSession(ctx, sid); err == nil {
-			return sid, nil
+		if _, err := b.oc.GetSession(ctx, st.SessionID); err == nil {
+			return st.SessionID, nil
 		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -177,8 +187,13 @@ func (b *Bot) ensureSession(userID, chatID int64) (string, error) {
 }
 
 func (b *Bot) agentFor(userID int64) string {
-	_, agent := b.snapshot(userID)
-	return agent
+	if st := b.stateOf(userID); st != nil && st.Agent != "" {
+		return st.Agent
+	}
+	if b.cfg != nil {
+		return b.cfg.Agent
+	}
+	return "build"
 }
 
 func (b *Bot) userForChat(chatID int64) int64 {
@@ -193,12 +208,12 @@ func (b *Bot) userForChat(chatID int64) int64 {
 }
 
 func (b *Bot) costLabel(userID int64) string {
-	sessionID, _ := b.snapshot(userID)
-	if sessionID == "" {
+	st := b.stateOf(userID)
+	if st == nil || st.SessionID == "" {
 		return btnStatus
 	}
 	b.mu.Lock()
-	if c, ok := b.costCache[userID]; ok && time.Since(c.when) < 4*time.Second {
+	if c, ok := b.cost[userID]; ok && time.Since(c.when) < 4*time.Second {
 		b.mu.Unlock()
 		return c.label
 	}
@@ -206,7 +221,7 @@ func (b *Bot) costLabel(userID int64) string {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
-	s, err := b.oc.GetSession(ctx, sessionID)
+	s, err := b.oc.GetSession(ctx, st.SessionID)
 	label := btnStatus
 	if err == nil {
 		total := s.Tokens.Input + s.Tokens.Output
@@ -217,7 +232,7 @@ func (b *Bot) costLabel(userID int64) string {
 		}
 	}
 	b.mu.Lock()
-	b.costCache[userID] = costInfo{when: time.Now(), label: label}
+	b.cost[userID] = costInfo{when: time.Now(), label: label}
 	b.mu.Unlock()
 	return label
 }
@@ -233,6 +248,8 @@ func abbrev(n int) string {
 	}
 }
 
+// ---------- کیبوردها ----------
+
 func (b *Bot) replyKeyboard(chatID int64) tgbotapi.ReplyKeyboardMarkup {
 	label := btnStatus
 	if uid := b.userForChat(chatID); uid != 0 {
@@ -244,16 +261,17 @@ func (b *Bot) replyKeyboard(chatID int64) tgbotapi.ReplyKeyboardMarkup {
 			{
 				{Text: label},
 				{Text: btnSettings},
-				{Text: btnStop},
+				{Text: btnSessions},
 			},
 		},
 	}
 }
 
-func (b *Bot) cancelKeyboard() *tgbotapi.InlineKeyboardMarkup {
+func stopKeyboard(sid string) *tgbotapi.InlineKeyboardMarkup {
+	data := "stop:" + sid
 	return &tgbotapi.InlineKeyboardMarkup{
 		InlineKeyboard: [][]tgbotapi.InlineKeyboardButton{{
-			{Text: "⏹ توقف", CallbackData: &cancelTag},
+			{Text: "⏹ توقف این نشست", CallbackData: &data},
 		}},
 	}
 }
@@ -268,9 +286,9 @@ func (b *Bot) send(chatID int64, text string) (int, error) {
 	return m.MessageID, nil
 }
 
-func (b *Bot) sendProgress(chatID int64, text string) (int, error) {
+func (b *Bot) sendProgress(chatID int64, text string, sid string) (int, error) {
 	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ReplyMarkup = b.cancelKeyboard()
+	msg.ReplyMarkup = stopKeyboard(sid)
 	m, err := b.api.Send(msg)
 	if err != nil {
 		return 0, err
@@ -322,6 +340,54 @@ func (b *Bot) sendChunks(chatID int64, text string, progressMsgID int) {
 	}
 }
 
+// ---------- مدیریت اجراها ----------
+
+func (b *Bot) runFor(sid string) (*runCtl, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	r, ok := b.runs[sid]
+	return r, ok
+}
+
+func (b *Bot) activeRunsOf(userID int64) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n := 0
+	for _, r := range b.runs {
+		if r.UserID == userID {
+			n++
+		}
+	}
+	return n
+}
+
+func (b *Bot) addRun(r *runCtl) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.runs[r.SID] = r
+}
+
+func (b *Bot) delRun(sid string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if r, ok := b.runs[sid]; ok {
+		close(r.done)
+		delete(b.runs, sid)
+	}
+}
+
+func (b *Bot) stopRun(sid string) bool {
+	r, ok := b.runFor(sid)
+	if !ok {
+		return false
+	}
+	r.cancel()
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	b.oc.Abort(ctx, sid)
+	return true
+}
+
 func (b *Bot) Handle(upd tgbotapi.Update) {
 	if upd.CallbackQuery != nil {
 		b.handleCallback(upd.CallbackQuery)
@@ -359,8 +425,8 @@ func (b *Bot) Handle(upd tgbotapi.Update) {
 	case btnSettings:
 		b.openSettings(userID, chatID)
 		return
-	case btnStop:
-		b.cancelRun(userID, chatID)
+	case btnSessions:
+		b.openSessions(userID, chatID, 0)
 		return
 	}
 	if st := b.stateFor(userID, chatID); st.Pending != "" {
@@ -386,19 +452,19 @@ func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
 		return
 	}
 	b.api.Request(tgbotapi.NewCallback(cq.ID, ""))
-	if strings.HasPrefix(cq.Data, "s:") {
-		b.onSettingsCallback(userID, chatID, cq.Message.MessageID, cq.Data)
-		return
-	}
-	if cq.Data == cancelTag {
-		b.cancelRun(userID, chatID)
+	data := cq.Data
+	switch {
+	case strings.HasPrefix(data, "s:"):
+		b.onSettingsCallback(userID, chatID, cq.Message.MessageID, data)
+	case strings.HasPrefix(data, "ss:"):
+		b.onSessionsCallback(userID, chatID, cq.Message.MessageID, data)
+	case strings.HasPrefix(data, "stop:"):
+		sid := strings.TrimPrefix(data, "stop:")
+		b.stopRun(sid)
 	}
 }
 
-func (b *Bot) setAgent(userID, chatID int64, agent string) {
-	b.setAgentValue(userID, agent)
-	b.send(chatID, "agent فعال: "+agent)
-}
+// ---------- فایل ----------
 
 func (b *Bot) handleFile(userID, chatID int64, fileID, fileName, caption string, isPhoto bool) {
 	path, err := b.download(fileID, fileName)
@@ -454,6 +520,8 @@ func (b *Bot) download(fileID, fileName string) (string, error) {
 	return dest, nil
 }
 
+// ---------- دستورات ----------
+
 func (b *Bot) handleCommand(upd tgbotapi.Update, text string) {
 	userID := upd.Message.From.ID
 	chatID := upd.Message.Chat.ID
@@ -466,20 +534,16 @@ func (b *Bot) handleCommand(upd tgbotapi.Update, text string) {
 	case "/start", "/help":
 		b.send(chatID, helpText)
 	case "/new":
-		b.setSession(userID, "")
-		sid, err := b.ensureSession(userID, chatID)
-		if err != nil {
-			b.send(chatID, err.Error())
-			return
-		}
-		b.send(chatID, "گفتگوی جدید شروع شد.\n"+sid)
+		b.newSession(userID, chatID)
+	case "/sessions":
+		b.openSessions(userID, chatID, 0)
 	case "/use":
 		if arg == "" {
 			b.send(chatID, "استفاده: /use <session id>")
 			return
 		}
 		b.setSession(userID, arg)
-		b.send(chatID, "session انتخاب شد: "+arg)
+		b.send(chatID, "نشست فعال شد: "+arg)
 	case "/list":
 		b.listSessions(chatID)
 	case "/status":
@@ -487,19 +551,33 @@ func (b *Bot) handleCommand(upd tgbotapi.Update, text string) {
 	case "/agent":
 		cur := b.agentFor(userID)
 		if arg != "" {
-			b.setAgent(userID, chatID, arg)
+			b.setAgentValue(userID, arg)
+			b.send(chatID, "agent فعال: "+arg)
 			return
 		}
-		b.send(chatID, "agent فعلی: "+cur+"\nبا دکمه‌های 🛠/🤖/🗂 عوضش کن.")
-	case "/queue":
-		b.showQueue(userID, chatID)
-	case "/flush":
-		b.flushQueue(userID, chatID)
+		b.send(chatID, "agent فعلی: "+cur+"\nبا دکمهٔ ⚙️ تنظیمات عوضش کن.")
 	case "/cancel":
-		b.cancelRun(userID, chatID)
+		st := b.stateOf(userID)
+		if st == nil || st.SessionID == "" || !b.stopRun(st.SessionID) {
+			b.send(chatID, "اجرایی برای نشست فعال در جریان نیست.")
+			return
+		}
+		b.send(chatID, "اجرای نشست فعال متوقف شد.")
 	default:
 		b.send(chatID, "دستور ناشناخته. برای راهنما: /help")
 	}
+}
+
+func (b *Bot) newSession(userID, chatID int64) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	s, err := b.oc.CreateSession(ctx)
+	if err != nil {
+		b.send(chatID, "ساخت نشست ممکن نشد: "+err.Error())
+		return
+	}
+	b.setSession(userID, s.ID)
+	b.send(chatID, "نشست جدید ساخته و فعال شد.\n"+s.ID)
 }
 
 func (b *Bot) listSessions(chatID int64) {
@@ -511,7 +589,7 @@ func (b *Bot) listSessions(chatID int64) {
 		return
 	}
 	var sb strings.Builder
-	sb.WriteString("آخرین sessionها:\n")
+	sb.WriteString("آخرین نشست‌های سرور:\n")
 	for _, s := range sessions {
 		title := strings.TrimSpace(s.Title)
 		if len([]rune(title)) > 40 {
@@ -523,22 +601,20 @@ func (b *Bot) listSessions(chatID int64) {
 }
 
 func (b *Bot) showStatus(userID, chatID int64) {
-	sessionID, agent := b.snapshot(userID)
-	if sessionID == "" {
-		b.send(chatID, "هنوز session‌ای ساخته نشده. /new بزن یا یک متن بفرست.")
+	st := b.stateOf(userID)
+	if st == nil || st.SessionID == "" {
+		b.send(chatID, "هنوز نشستی ساخته نشده. /new بزن یا یک متن بفرست.")
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	s, err := b.oc.GetSession(ctx, sessionID)
+	s, err := b.oc.GetSession(ctx, st.SessionID)
 	if err != nil {
 		b.send(chatID, "خطا: "+err.Error())
 		return
 	}
-	if agent == "" {
-		agent = b.cfg.Agent
-	}
-	msg := fmt.Sprintf("session: %s\n", s.ID)
+	agent := b.agentFor(userID)
+	msg := fmt.Sprintf("نشست فعال: %s\n", s.ID)
 	if t := strings.TrimSpace(s.Title); t != "" {
 		msg += "عنوان: " + t + "\n"
 	}
@@ -551,79 +627,7 @@ func (b *Bot) showStatus(userID, chatID int64) {
 	b.send(chatID, msg)
 }
 
-func (b *Bot) showQueue(userID, chatID int64) {
-	b.mu.Lock()
-	n := len(b.queues[userID])
-	busy := b.busy[userID]
-	b.mu.Unlock()
-	if busy {
-		b.send(chatID, "یک مورد در حال اجراست و "+strconv.Itoa(n)+" مورد در صف است.")
-		return
-	}
-	if n == 0 {
-		b.send(chatID, "صف خالی است.")
-		return
-	}
-	b.send(chatID, strconv.Itoa(n)+" مورد در صف است.")
-}
-
-func (b *Bot) flushQueue(userID, chatID int64) {
-	b.mu.Lock()
-	n := len(b.queues[userID])
-	b.queues[userID] = nil
-	b.mu.Unlock()
-	if n == 0 {
-		b.send(chatID, "صف از قبل خالی بود.")
-		return
-	}
-	b.send(chatID, fmt.Sprintf("%d مورد صف پاک شد.", n))
-}
-
-func (b *Bot) cancelRun(userID, chatID int64) {
-	sessionID, _ := b.snapshot(userID)
-	b.mu.Lock()
-	busy := b.busy[userID]
-	var c context.CancelFunc
-	if busy {
-		c = b.cancels[userID]
-	}
-	pending := len(b.queues[userID])
-	b.queues[userID] = nil
-	b.mu.Unlock()
-
-	if !busy && pending == 0 {
-		b.send(chatID, "هیچ اجرایی در جریان نیست.")
-		return
-	}
-	if c != nil {
-		c()
-	}
-	if sessionID != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		b.oc.Abort(ctx, sessionID)
-	}
-	msg := "اجرا متوقف شد."
-	if pending > 0 {
-		msg += fmt.Sprintf(" %d مورد صف هم حذف شد.", pending)
-	}
-	b.send(chatID, msg)
-}
-
-func (b *Bot) setBusy(userID int64, busy bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.busy[userID] = busy
-	if !busy {
-		delete(b.cancels, userID)
-	}
-}
-
-func (b *Bot) isBusy(userID int64) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.busy[userID]
-}
+// ---------- ارسال پرامپت و اجرا ----------
 
 func (b *Bot) submitPrompt(userID, chatID int64, prompt string) {
 	if !b.ocReady() {
@@ -631,72 +635,51 @@ func (b *Bot) submitPrompt(userID, chatID int64, prompt string) {
 		b.openSettings(userID, chatID)
 		return
 	}
-	b.mu.Lock()
-	if b.processing[userID] {
-		b.queues[userID] = append(b.queues[userID], queueItem{ChatID: chatID, Prompt: prompt})
-		n := len(b.queues[userID])
-		b.mu.Unlock()
-		b.send(chatID, fmt.Sprintf("یک کار در جریان است؛ فرمان در صف قرار گرفت (موقعیت %d).", n))
+	if b.activeRunsOf(userID) >= maxConcurrentRuns {
+		b.send(chatID, fmt.Sprintf("بیشتر از %d اجرای هم‌زمان مجاز نیست؛ صبر کن یکی تمام شود.", maxConcurrentRuns))
 		return
 	}
-	b.processing[userID] = true
-	b.queues[userID] = append(b.queues[userID], queueItem{ChatID: chatID, Prompt: prompt})
-	b.mu.Unlock()
-	go b.processQueue(userID)
-}
-
-func (b *Bot) processQueue(userID int64) {
-	for {
-		b.mu.Lock()
-		q := b.queues[userID]
-		if len(q) == 0 {
-			b.processing[userID] = false
-			b.mu.Unlock()
-			return
-		}
-		item := q[0]
-		b.queues[userID] = q[1:]
-		b.mu.Unlock()
-		b.runPrompt(userID, item.ChatID, item.Prompt)
-	}
-}
-
-func (b *Bot) runPrompt(userID, chatID int64, prompt string) {
-	b.setBusy(userID, true)
-	defer b.setBusy(userID, false)
-
-	sessionID, agent := b.snapshot(userID)
-	if sessionID == "" {
-		var err error
-		sessionID, err = b.ensureSession(userID, chatID)
+	st := b.stateFor(userID, chatID)
+	if st.SessionID == "" {
+		sid, err := b.ensureSession(userID, chatID)
 		if err != nil {
 			b.send(chatID, err.Error())
 			return
 		}
-		_, agent = b.snapshot(userID)
+		st = b.stateFor(userID, chatID)
+		st.SessionID = sid
 	}
+	sid := st.SessionID
+	if _, busy := b.runFor(sid); busy {
+		b.send(chatID, "این نشست الان در حال اجراست.\nبا دکمهٔ 🗂 نشست‌ها یک نشست دیگر بساز یا یکی از نشست‌ها را انتخاب کن تا هم‌زمان جلو برویم.")
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	r := &runCtl{SID: sid, UserID: userID, ChatID: chatID, cancel: cancel, done: make(chan struct{}), started: time.Now()}
+	b.addRun(r)
+	go b.runPrompt(ctx, r, prompt)
+}
 
-	progressMsg, err := b.sendProgress(chatID, "در حال انجام…")
+func (b *Bot) runPrompt(ctx context.Context, r *runCtl, prompt string) {
+	defer b.delRun(r.SID)
+
+	agent := b.agentFor(r.UserID)
+	progressMsg, err := b.sendProgress(r.ChatID, "در حال انجام…", r.SID)
 	if err != nil {
 		return
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	b.mu.Lock()
-	b.cancels[userID] = cancel
-	b.mu.Unlock()
-	defer cancel()
-
-	if err := b.oc.PromptAsync(ctx, sessionID, prompt, agent); err != nil {
-		b.edit(chatID, progressMsg, "ارسال دستور ناموفق بود: "+err.Error())
+	if err := b.oc.PromptAsync(ctx, r.SID, prompt, agent); err != nil {
+		b.edit(r.ChatID, progressMsg, "ارسال دستور ناموفق بود: "+err.Error())
+		b.removeInline(r.ChatID, progressMsg)
 		return
 	}
 
-	final := b.poll(ctx, userID, chatID, sessionID, progressMsg)
-	b.sendChunks(chatID, final, progressMsg)
+	final := b.poll(ctx, r, progressMsg)
+	b.sendChunks(r.ChatID, final, progressMsg)
 }
 
-func (b *Bot) poll(ctx context.Context, userID int64, chatID int64, sessionID string, progressMsg int) string {
+func (b *Bot) poll(ctx context.Context, r *runCtl, progressMsg int) string {
 	ticker := time.NewTicker(1500 * time.Millisecond)
 	defer ticker.Stop()
 	start := time.Now()
@@ -708,7 +691,7 @@ func (b *Bot) poll(ctx context.Context, userID int64, chatID int64, sessionID st
 		case <-ctx.Done():
 			return "⛔ متوقف شد."
 		case now := <-ticker.C:
-			msg, err := b.oc.LastMessage(ctx, sessionID)
+			msg, err := b.oc.LastMessage(ctx, r.SID)
 			if err != nil {
 				errCount++
 				if errCount > 5 {
@@ -728,7 +711,7 @@ func (b *Bot) poll(ctx context.Context, userID int64, chatID int64, sessionID st
 					return curText
 				}
 				if qs := pendingQuestions(msg); qs != "" {
-					b.oc.Abort(ctx, sessionID)
+					b.oc.Abort(ctx, r.SID)
 					if curText == "" {
 						curText = "⚠️ پاسخ ناقص تولید شد."
 					}
@@ -750,10 +733,120 @@ func (b *Bot) poll(ctx context.Context, userID int64, chatID int64, sessionID st
 				show = label + "\n⏳ " + durText(int(now.Sub(start).Seconds()))
 			}
 			if show != lastShown && now.Sub(lastEdit) >= interval {
-				b.edit(chatID, progressMsg, show)
+				b.edit(r.ChatID, progressMsg, show)
 				lastShown = show
 				lastEdit = now
 			}
+		}
+	}
+}
+
+// ---------- مدیریت نشست‌ها ----------
+
+func shortSID(sid string) string {
+	s := strings.TrimPrefix(sid, "ses_")
+	if len(s) > 12 {
+		return s[:12]
+	}
+	return s
+}
+
+func (b *Bot) sessionLine(userID int64, st *UserState, sid string) string {
+	_, running := b.runFor(sid)
+	line := "`" + shortSID(sid) + "`"
+	if sid == st.SessionID {
+		line += " ← فعال"
+	}
+	if running {
+		line += " ⏳ در حال اجرا"
+	}
+	return line
+}
+
+func (b *Bot) openSessions(userID, chatID int64, msgID int) {
+	st := b.stateFor(userID, chatID)
+	var sb strings.Builder
+	sb.WriteString("🗂 <b>نشست‌ها</b>\n\n")
+	if len(st.Sessions) == 0 {
+		if st.SessionID != "" {
+			st.Sessions = append(st.Sessions, st.SessionID)
+		}
+	}
+	if len(st.Sessions) == 0 {
+		sb.WriteString("هنوز نشستی نداری.\n«➕ نشست جدید» را بزن یا یک متن بفرست تا خودکار ساخته شود.")
+	} else {
+		for _, sid := range st.Sessions {
+			sb.WriteString(b.sessionLine(userID, st, sid) + "\n")
+		}
+		sb.WriteString("\nبا ➕ نشست جدید بساز؛ اجراهای در جریان قطع نمی‌شوند.")
+	}
+
+	var rows [][]tgbotapi.InlineKeyboardButton
+	for _, sid := range st.Sessions {
+		var row []tgbotapi.InlineKeyboardButton
+		row = append(row, inlineBtn("`"+shortSID(sid)+"`", "ss:noop"))
+		if sid != st.SessionID {
+			row = append(row, inlineBtn("➡️ برو", "ss:use:"+sid))
+		} else {
+			row = append(row, inlineBtn("✓ فعلی", "ss:noop"))
+		}
+		if _, running := b.runFor(sid); running {
+			row = append(row, inlineBtn("⏹", "ss:stop:"+sid))
+		}
+		rows = append(rows, row)
+	}
+	rows = append(rows, []tgbotapi.InlineKeyboardButton{inlineBtn("➕ نشست جدید", "ss:new")})
+	rows = append(rows, []tgbotapi.InlineKeyboardButton{inlineBtn("🔄 تازه‌سازی", "ss:refresh"), inlineBtn("❌ بستن", "ss:close")})
+
+	kb := rowsOf(rows...)
+	if msgID == 0 {
+		msg := tgbotapi.NewMessage(chatID, sb.String())
+		msg.ParseMode = "HTML"
+		msg.ReplyMarkup = kb
+		b.api.Send(msg)
+		return
+	}
+	edit := tgbotapi.NewEditMessageText(chatID, msgID, sb.String())
+	edit.ParseMode = "HTML"
+	edit.ReplyMarkup = kb
+	b.api.Send(edit)
+}
+
+func (b *Bot) onSessionsCallback(userID, chatID int64, msgID int, data string) {
+	switch data {
+	case "ss:refresh":
+		b.openSessions(userID, chatID, msgID)
+	case "ss:close":
+		edit := tgbotapi.NewEditMessageText(chatID, msgID, "بسته شد.")
+		b.api.Send(edit)
+	case "ss:new":
+		b.edit(chatID, msgID, "در حال ساخت نشست جدید…")
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		s, err := b.oc.CreateSession(ctx)
+		if err != nil {
+			b.edit(chatID, msgID, "ساخت نشست ممکن نشد: "+err.Error())
+			return
+		}
+		b.setSession(userID, s.ID)
+		b.send(chatID, "✅ نشست جدید ساخته و فعال شد:\n"+s.ID)
+		b.openSessions(userID, chatID, msgID)
+	default:
+		parts := strings.SplitN(data, ":", 3)
+		if len(parts) < 3 {
+			return
+		}
+		switch parts[1] {
+		case "use":
+			sid := parts[2]
+			b.setSession(userID, sid)
+			b.send(chatID, "نشست فعال شد: "+sid)
+			b.openSessions(userID, chatID, msgID)
+		case "stop":
+			if b.stopRun(parts[2]) {
+				b.send(chatID, "اجرای نشست متوقف شد.")
+			}
+			b.openSessions(userID, chatID, msgID)
 		}
 	}
 }
