@@ -114,16 +114,24 @@ func (c *OCClient) CreateSession(ctx context.Context) (*OCSession, error) {
 
 func (c *OCClient) ListSessions(ctx context.Context, limit int) ([]OCSession, error) {
 	if limit <= 0 {
-		limit = 5
+		limit = 100
 	}
 	var list []OCSession
-	if err := c.doJSON(ctx, http.MethodGet, "/session", nil, &list); err != nil {
+	// limit سمت سرور اعمال می‌شود؛ سرور به‌ترتیب «آخرین فعالیت» برمی‌گرداند
+	if err := c.doJSON(ctx, http.MethodGet, "/session?limit="+strconv.Itoa(limit), nil, &list); err != nil {
 		return nil, err
 	}
-	if len(list) > limit {
-		list = list[:limit]
-	}
 	return list, nil
+}
+
+// DeleteSession نشست و تمام داده‌هایش را روی سرور حذف می‌کند
+func (c *OCClient) DeleteSession(ctx context.Context, id string) error {
+	err := c.doJSON(ctx, http.MethodDelete, "/session/"+url.PathEscape(id), nil, nil)
+	if err != nil && strings.Contains(err.Error(), "404") {
+		// از قبل حذف شده؛ اشکالی ندارد
+		return nil
+	}
+	return err
 }
 
 func (c *OCClient) GetSession(ctx context.Context, id string) (*OCSession, error) {

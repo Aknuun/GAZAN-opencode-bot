@@ -44,13 +44,21 @@ const helpText = `ربات کنترل opencode روی سرور
 
 const (
 	btnStatus    = "📊 وضعیت و هزینه"
-	btnModel     = "🧠 مدل فعال"
 	btnSettings  = "⚙️ تنظیمات"
 	btnSessions  = "🗂 نشست‌ها"
 	maxFileBytes = 30 << 20
 
 	// حداکثر اجرای هم‌زمان برای هر کاربر
 	maxConcurrentRuns = 6
+
+	// اگر مدل این مدت هیچ متن/فعالیت تازه‌ای تولید نکند، اجرا متوقف می‌شود
+	// (وقتی پروایدر پاسخ نمی‌دهد، poll نباید بی‌نهایت «در حال انجام» بماند)
+	pollQuietLimit = 6 * time.Minute
+
+	// نمایش «🗂 نشست‌ها» مستقیماً از سرور opencode (نه فقط فهرست محلی ربات)
+	maxTrackedSessions = 80  // حداکثر نشستی که ربات در state نگه می‌دارد
+	sessionsFetchMax   = 300 // چند نشست اخیر سرور برای همگام‌سازی واکشی شود
+	sessionsPageSize   = 6   // هر صفحه از مدیر نشست‌ها چند نشست نشان دهد
 )
 
 type UserState struct {
@@ -90,6 +98,7 @@ type Bot struct {
 	cat *modelCatalog       // کاتالوگ مدل‌ها (models.dev) با کش
 	mlc map[int64]modelsCtx // صفحهٔ مدل‌های بازشده برای هر چت
 	scx map[int64]searchCtx // نتایج جست‌وجوی باز برای هر چت
+	ssp map[int64]int       // آخرین صفحهٔ باز «🗂 نشست‌ها» برای هر چت
 }
 
 type costInfo struct {
@@ -109,6 +118,7 @@ func newBot(cfg *Config, api *tgbotapi.BotAPI) *Bot {
 		cat:    newModelCatalog(filepath.Join(filepath.Dir(cfg.StateFile), "catalog-models.json")),
 		mlc:    map[int64]modelsCtx{},
 		scx:    map[int64]searchCtx{},
+		ssp:    map[int64]int{},
 	}
 }
 
@@ -407,9 +417,6 @@ func (b *Bot) replyKeyboard(chatID int64) tgbotapi.ReplyKeyboardMarkup {
 				{Text: btnSettings},
 				{Text: btnSessions},
 			},
-			{
-				{Text: btnModel},
-			},
 		},
 	}
 }
@@ -574,9 +581,6 @@ func (b *Bot) Handle(upd tgbotapi.Update) {
 		return
 	case btnSessions:
 		b.openSessions(userID, chatID, 0)
-		return
-	case btnModel:
-		b.showModelInfo(userID, chatID)
 		return
 	}
 	if st := b.stateFor(userID, chatID); st.Pending != "" {
@@ -779,21 +783,6 @@ func (b *Bot) showStatus(userID, chatID int64) {
 	b.send(chatID, msg)
 }
 
-func (b *Bot) showModelInfo(userID, chatID int64) {
-	env := b.envFor()
-	model := env.currentModel()
-	agent := b.agentFor(userID)
-	if model == "" {
-		b.send(chatID, "سلام! 👋 من ربات روی سرور opencode هستم.\nهنوز مدلی ست نشده. با ⚙️ تنظیمات یک مدل انتخاب کن.")
-		return
-	}
-	msg := "سلام! 👋 من ربات روی سرور opencode هستم.\n\n"
-	msg += "🧠 مدل فعلی: " + model + "\n"
-	msg += "🤖 agent: " + agent + "\n\n"
-	msg += "این مدلی است که به پیام‌هایت پاسخ می‌دهد."
-	b.send(chatID, msg)
-}
-
 // abortAllRuns همهٔ اجرای‌های فعال را متوقف می‌کند (بعد از تغییر مدل)
 // بعد از ری‌استارت سرور، تمام اجرای‌های قبلی بی‌اعتبار می‌شوند
 func (b *Bot) abortAllRuns() {
@@ -869,6 +858,8 @@ func (b *Bot) poll(ctx context.Context, r *runCtl, progressMsg int) string {
 	lastShown := ""
 	lastEdit := time.Time{}
 	errCount := 0
+	lastSig := ""
+	lastChange := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
@@ -885,8 +876,10 @@ func (b *Bot) poll(ctx context.Context, r *runCtl, progressMsg int) string {
 			errCount = 0
 
 			curText := ""
+			act := ""
 			if msg != nil && msg.Info.Role == "assistant" {
 				curText = joinText(msg)
+				act = activityLabel(msg)
 				if isFinalFinish(msg.Info.Finish) {
 					if curText == "" {
 						curText = "⚠️ پاسخی دریافت نشد."
@@ -900,18 +893,27 @@ func (b *Bot) poll(ctx context.Context, r *runCtl, progressMsg int) string {
 					// بعد از پاسخ به سؤال، وضعیت زنده را از نو نشان بده
 					lastShown = ""
 					lastEdit = time.Time{}
+					lastSig = ""
+					lastChange = now
 					continue
 				}
+			}
+
+			// اگر مدل مدت طولانی هیچ متن/فعالیت تازه‌ای تولید نکرد،
+			// احتمالاً پروایدر پاسخ نمی‌دهد؛ حلقه را بی‌نهایت ادامه نده.
+			sig := curText + "\x00" + act
+			if sig != lastSig {
+				lastSig = sig
+				lastChange = now
+			} else if now.Sub(lastChange) >= pollQuietLimit {
+				return "⚠️ بیش از " + pollQuietLimit.String() + " است که مدل هیچ پاسخ یا فعالیتی تولید نکرده؛ احتمالاً پروایدر مشکل دارد.\nبا /new یک نشست تازه بساز یا مدل را در ⚙️ تنظیمات عوض کن."
 			}
 
 			interval := 900 * time.Millisecond
 			show := preview(curText)
 			if curText == "" {
 				interval = 2 * time.Second
-				label := ""
-				if msg != nil && msg.Info.Role == "assistant" {
-					label = activityLabel(msg)
-				}
+				label := act
 				if label == "" {
 					label = "🧠 در حال فکر کردن…"
 				}
@@ -1009,59 +1011,210 @@ func (b *Bot) sessionTopicsText(sid string) string {
 }
 
 func (b *Bot) openSessions(userID, chatID int64, msgID int) {
-	st := b.stateFor(userID, chatID)
+	b.sessionsPage(userID, chatID, msgID, 0)
+}
+
+// lastSSPage آخرین صفحه‌ای که کاربر در مدیر نشست‌ها دیده را برمی‌گرداند
+func (b *Bot) lastSSPage(chatID int64) int {
 	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.ssp == nil {
+		return 0
+	}
+	return b.ssp[chatID]
+}
+
+func (b *Bot) setSSPage(chatID int64, page int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.ssp == nil {
+		b.ssp = map[int64]int{}
+	}
+	b.ssp[chatID] = page
+}
+
+// sessionsAtSamePage مدیر نشست‌ها را در همان صفحهٔ قبلی دوباره باز می‌کند
+func (b *Bot) sessionsAtSamePage(userID, chatID int64, msgID int) {
+	b.sessionsPage(userID, chatID, msgID, b.lastSSPage(chatID))
+}
+
+// syncLiveSessions فهرست نشست‌های ربات را با sessionهای واقعی سرور همگام می‌کند:
+// نشست‌های تازهٔ سرور (مثل نشست‌های ساخته‌شده از CLI) اضافه و نشست‌های حذف‌شده حذف می‌شوند.
+// شماره‌گذاری و نام‌های دستی کاربر دست‌نخورده می‌مانند.
+func (b *Bot) syncLiveSessions(st *UserState, list []OCSession) {
+	onSrv := make(map[string]bool, len(list))
+	order := make([]string, 0, len(list))
+	for _, s := range list {
+		onSrv[s.ID] = true
+		order = append(order, s.ID) // سرور به‌ترتیب «آخرین فعالیت» برمی‌گرداند
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	if st.Labels == nil {
 		st.Labels = map[string]string{}
 	}
-	if st.SessionID != "" {
-		had := false
-		for _, s := range st.Sessions {
-			if s == st.SessionID {
-				had = true
-				break
-			}
-		}
-		if !had {
-			st.Sessions = append(st.Sessions, st.SessionID)
+	if st.Manual == nil {
+		st.Manual = map[string]bool{}
+	}
+
+	// نشست فعال اگر روی سرور حذف شده باشد دیگر معتبر نیست
+	if st.SessionID != "" && !onSrv[st.SessionID] {
+		st.SessionID = ""
+	}
+
+	// نشست‌هایی که دیگر روی سرور نیستند از فهرست حذف شوند
+	keep := st.Sessions[:0]
+	for _, sid := range st.Sessions {
+		if onSrv[sid] {
+			keep = append(keep, sid)
 		}
 	}
+	st.Sessions = keep
+
+	// نشست‌های تازهٔ سرور به انتهای فهرست افزوده شوند (تا شماره‌ها ثابت بمانند)
+	have := make(map[string]bool, len(st.Sessions))
+	for _, sid := range st.Sessions {
+		have[sid] = true
+	}
+	for _, sid := range order {
+		if have[sid] {
+			continue
+		}
+		st.Sessions = append(st.Sessions, sid)
+		have[sid] = true
+	}
+
+	// برش به حداکثر مجاز؛ نشست فعال/درحال‌اجرا/نام‌گذاری‌شده هرگز حذف نمی‌شود
+	if len(st.Sessions) > maxTrackedSessions {
+		cut := st.Sessions[:0]
+		running := make(map[string]bool, len(b.runs))
+		for id := range b.runs {
+			running[id] = true
+		}
+		over := len(st.Sessions) - maxTrackedSessions
+		for _, sid := range st.Sessions {
+			if over > 0 && sid != st.SessionID && !running[sid] && !st.Manual[sid] {
+				over--
+				continue
+			}
+			cut = append(cut, sid)
+		}
+		st.Sessions = cut
+	}
+
+	// پاکسازی برچسب نشست‌هایی که دیگر در فهرست نیستند
+	st.Sessions = addSessionID(st.Sessions, st.SessionID)
+	kept := make(map[string]bool, len(st.Sessions))
+	for _, sid := range st.Sessions {
+		kept[sid] = true
+	}
+	for sid := range st.Labels {
+		if !kept[sid] {
+			delete(st.Labels, sid)
+		}
+	}
+	for sid := range st.Manual {
+		if !kept[sid] {
+			delete(st.Manual, sid)
+		}
+	}
+
 	renumberAutoLabels(st)
-	var ids []string
-	ids = append(ids, st.Sessions...)
-	labels := map[string]string{}
+	b.saveStates()
+}
+
+// sessionsPage یک صفحه از مدیر نشست‌ها را نشان می‌دهد؛ ابتدا از سرور همگام می‌شود
+func (b *Bot) sessionsPage(userID, chatID int64, msgID, page int) {
+	st := b.stateFor(userID, chatID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	list, err := b.oc.ListSessions(ctx, sessionsFetchMax)
+	cancel()
+	var warn error
+	if err == nil {
+		b.syncLiveSessions(st, list)
+	} else {
+		warn = err
+	}
+
+	b.mu.Lock()
+	ids := make([]string, len(st.Sessions))
+	copy(ids, st.Sessions)
+	labels := make(map[string]string, len(st.Labels))
 	for k, v := range st.Labels {
 		labels[k] = v
 	}
 	active := st.SessionID
-	b.saveStates()
 	b.mu.Unlock()
 
-	var sb strings.Builder
-	sb.WriteString("🗂 <b>نشست‌ها</b>\n\n")
 	if len(ids) == 0 {
-		sb.WriteString("هنوز نشستی نداری.\n«➕ نشست جدید» را بزن یا یک متن بفرست تا خودکار ساخته شود.")
-	} else {
-		for i, sid := range ids {
-			_, running := b.runFor(sid)
-			name := labels[sid]
-			if name == "" {
-				name = defaultSessionName(i + 1)
-			}
-			line := fmt.Sprintf("<b>%s</b>  `%s`", name, shortSID(sid))
-			if sid == active {
-				line += "  ← فعال"
-			}
-			if running {
-				line += "  ⏳"
-			}
-			sb.WriteString(line + "\n")
+		text := "🗂 <b>نشست‌ها</b>\n\n"
+		if warn != nil {
+			text += "⚠️ سرور در دسترس نبود.\n"
 		}
-		sb.WriteString("\nنام پیش‌فرض نشست‌ها شماره است (۱، ۲، ۳…). با ✏️ می‌توانی نام دلخواه بگذاری و با 🗑 نشست را ببندی. جابه‌جایی، اجرای در جریان را قطع نمی‌کند.")
+		text += "هنوز نشستی روی سرور نیست.\n«➕ نشست جدید» را بزن یا یک متن بفرست تا خودکار ساخته شود."
+		kb := rowsOf([]tgbotapi.InlineKeyboardButton{inlineBtn("➕ نشست جدید", "ss:new")})
+		if msgID == 0 {
+			msg := tgbotapi.NewMessage(chatID, text)
+			msg.ParseMode = "HTML"
+			msg.ReplyMarkup = kb
+			b.api.Send(msg)
+		} else {
+			edit := tgbotapi.NewEditMessageText(chatID, msgID, text)
+			edit.ParseMode = "HTML"
+			edit.ReplyMarkup = kb
+			b.api.Send(edit)
+		}
+		return
 	}
 
+	total := len(ids)
+	pages := (total + sessionsPageSize - 1) / sessionsPageSize
+	if page < 0 {
+		page = 0
+	}
+	if page >= pages {
+		page = pages - 1
+	}
+	start := page * sessionsPageSize
+	end := start + sessionsPageSize
+	if end > total {
+		end = total
+	}
+	b.setSSPage(chatID, page)
+
+	var sb strings.Builder
+	sb.WriteString("🗂 <b>نشست‌ها</b>")
+	if pages > 1 {
+		fmt.Fprintf(&sb, "  (صفحه %s از %s)", faNum(page+1), faNum(pages))
+	}
+	sb.WriteString("\n")
+	if warn != nil {
+		sb.WriteString("⚠️ سرور در دسترس نبود؛ نشست‌های ذخیره‌شده نمایش داده می‌شود.\n")
+	}
+	for i := start; i < end; i++ {
+		sid := ids[i]
+		_, running := b.runFor(sid)
+		name := labels[sid]
+		if name == "" {
+			name = defaultSessionName(i + 1)
+		}
+		line := fmt.Sprintf("<b>%s</b>  `%s`", name, shortSID(sid))
+		if sid == active {
+			line += "  ← فعال"
+		}
+		if running {
+			line += "  ⏳"
+		}
+		sb.WriteString(line + "\n")
+	}
+	sb.WriteString("\nفهرست همان نشست‌های واقعی سرور است؛ 🗑 نشست را روی سرور هم برای همیشه حذف می‌کند.")
+
 	var rows [][]tgbotapi.InlineKeyboardButton
-	for i, sid := range ids {
+	for i := start; i < end; i++ {
+		sid := ids[i]
 		label := labels[sid]
 		if label == "" {
 			label = defaultSessionName(i + 1)
@@ -1079,8 +1232,24 @@ func (b *Bot) openSessions(userID, chatID int64, msgID int) {
 		row = append(row, inlineBtn("🗑", "ss:del:"+sid))
 		rows = append(rows, row)
 	}
-	rows = append(rows, []tgbotapi.InlineKeyboardButton{inlineBtn("➕ نشست جدید", "ss:new")})
-	rows = append(rows, []tgbotapi.InlineKeyboardButton{inlineBtn("🔄 تازه‌سازی", "ss:refresh"), inlineBtn("❌ بستن", "ss:close")})
+	if pages > 1 {
+		nav := []tgbotapi.InlineKeyboardButton{}
+		if page > 0 {
+			nav = append(nav, inlineBtn("◀️ قبلی", "ss:pg:"+strconv.Itoa(page-1)))
+		} else {
+			nav = append(nav, inlineBtn("⏺", "ss:noop"))
+		}
+		nav = append(nav, inlineBtn(fmt.Sprintf("%s/%s", faNum(page+1), faNum(pages)), "ss:noop"))
+		if page+1 < pages {
+			nav = append(nav, inlineBtn("بعدی ▶️", "ss:pg:"+strconv.Itoa(page+1)))
+		} else {
+			nav = append(nav, inlineBtn("⏺", "ss:noop"))
+		}
+		rows = append(rows, nav)
+	}
+	rows = append(rows,
+		[]tgbotapi.InlineKeyboardButton{inlineBtn("➕ نشست جدید", "ss:new"), inlineBtn("🔄 تازه‌سازی", "ss:refresh"), inlineBtn("❌ بستن", "ss:close")},
+	)
 
 	kb := rowsOf(rows...)
 	if msgID == 0 {
@@ -1099,7 +1268,7 @@ func (b *Bot) openSessions(userID, chatID int64, msgID int) {
 func (b *Bot) onSessionsCallback(userID, chatID int64, msgID int, data string) {
 	switch data {
 	case "ss:refresh":
-		b.openSessions(userID, chatID, msgID)
+		b.sessionsAtSamePage(userID, chatID, msgID)
 	case "ss:close":
 		edit := tgbotapi.NewEditMessageText(chatID, msgID, "بسته شد.")
 		b.api.Send(edit)
@@ -1115,17 +1284,21 @@ func (b *Bot) onSessionsCallback(userID, chatID int64, msgID int, data string) {
 		b.setSession(userID, s.ID)
 		st := b.stateFor(userID, chatID)
 		b.send(chatID, "✅ نشست جدید ساخته و فعال شد:\n"+b.sessionLabel(st, s.ID)+"\n"+s.ID)
-		b.openSessions(userID, chatID, msgID)
+		b.sessionsAtSamePage(userID, chatID, msgID)
 	default:
 		parts := strings.SplitN(data, ":", 3)
 		if len(parts) < 3 {
 			return
 		}
 		switch parts[1] {
+		case "pg":
+			if p, err := strconv.Atoi(parts[2]); err == nil {
+				b.sessionsPage(userID, chatID, msgID, p)
+			}
 		case "use":
 			sid := parts[2]
 			b.useSession(userID, chatID, sid)
-			b.openSessions(userID, chatID, msgID)
+			b.sessionsAtSamePage(userID, chatID, msgID)
 		case "rn":
 			sid := parts[2]
 			b.setPendingByChat(chatID, "rn:"+sid)
@@ -1134,7 +1307,7 @@ func (b *Bot) onSessionsCallback(userID, chatID int64, msgID int, data string) {
 		case "del":
 			sid := parts[2]
 			st := b.stateFor(userID, chatID)
-			edit := tgbotapi.NewEditMessageText(chatID, msgID, "🗑 نشست «"+b.sessionLabel(st, sid)+"» حذف شود؟\n(اگر اجرایی در جریان باشد متوقف می‌شود.)")
+			edit := tgbotapi.NewEditMessageText(chatID, msgID, "🗑 نشست «"+b.sessionLabel(st, sid)+"» برای همیشه حذف شود؟\nاین نشست و تمام گفتگویش از روی سرور opencode پاک می‌شود (غیرقابل بازگشت). اجرای در جریان هم متوقف می‌شود.")
 			edit.ReplyMarkup = rowsOf(
 				[]tgbotapi.InlineKeyboardButton{inlineBtn("🗑 بله، حذف کن", "ss:delc:"+sid)},
 				[]tgbotapi.InlineKeyboardButton{inlineBtn("انصراف", "ss:refresh")},
@@ -1142,14 +1315,23 @@ func (b *Bot) onSessionsCallback(userID, chatID int64, msgID int, data string) {
 			b.api.Send(edit)
 		case "delc":
 			sid := parts[2]
+			b.stopRun(sid)
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			err := b.oc.DeleteSession(ctx, sid)
+			cancel()
+			if err != nil {
+				b.send(chatID, "❌ حذف نشست روی سرور ممکن نشد: "+err.Error())
+				b.sessionsAtSamePage(userID, chatID, msgID)
+				return
+			}
 			b.deleteSession(userID, sid)
-			b.send(chatID, "🗑 نشست حذف شد.")
-			b.openSessions(userID, chatID, msgID)
+			b.send(chatID, "🗑 نشست از روی سرور حذف شد.")
+			b.sessionsAtSamePage(userID, chatID, msgID)
 		case "stop":
 			if b.stopRun(parts[2]) {
 				b.send(chatID, "اجرای نشست متوقف شد.")
 			}
-			b.openSessions(userID, chatID, msgID)
+			b.sessionsAtSamePage(userID, chatID, msgID)
 		}
 	}
 }
