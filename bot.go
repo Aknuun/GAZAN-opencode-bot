@@ -62,12 +62,12 @@ const helpText = `ربات کنترل opencode روی سرور
 اگر مدل در میانهٔ کار سؤالی بپرسد (مثل خود CLI)، همان پیام گزینه‌ها را دارد؛ با دکمه‌ها پاسخ بده تا اجرا ادامه یابد. ✏️ یعنی می‌توانی پاسخ خودت را تایپ کنی.`
 
 // botVersion نسخهٔ ربات است؛ هنگام انتشار نسخهٔ جدید آن را به‌روز کن
-const botVersion = "v8.3"
+const botVersion = "v8.4"
 
 const (
-	btnStatus    = "📊 وضعیت و هزینه"
-	btnSettings  = "⚙️ تنظیمات " + botVersion
-	btnSessions  = "🗂 نشست‌ها"
+	btnStatus    = "وضعیت و هزینه"
+	btnSettings  = "تنظیمات " + botVersion
+	btnSessions  = "نشست‌ها"
 	maxFileBytes = 30 << 20
 
 	// حداکثر اجرای هم‌زمان برای هر کاربر
@@ -223,9 +223,9 @@ func (b *Bot) costLabel(userID int64) string {
 	label := btnStatus
 	if err == nil {
 		if s.Cost > 0 {
-			label = "📊 " + b.costButton(s.Cost)
+			label = "هزینه: " + b.costButton(s.Cost)
 		} else {
-			label = "📊 هزینه $0 · بدون مصرف"
+			label = "هزینه: بدون مصرف"
 		}
 	}
 	b.ui.storeCost(userID, label)
@@ -400,7 +400,7 @@ func (b *Bot) Handle(upd tgbotapi.Update) {
 		return
 	}
 	text := strings.TrimSpace(upd.Message.Text)
-	if strings.HasPrefix(text, "📊") {
+	if text == btnStatus || strings.HasPrefix(text, "هزینه: ") {
 		b.showStatus(userID, chatID)
 		return
 	}
