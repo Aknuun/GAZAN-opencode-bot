@@ -62,7 +62,7 @@ const helpText = `ربات کنترل opencode روی سرور
 اگر مدل در میانهٔ کار سؤالی بپرسد (مثل خود CLI)، همان پیام گزینه‌ها را دارد؛ با دکمه‌ها پاسخ بده تا اجرا ادامه یابد. ✏️ یعنی می‌توانی پاسخ خودت را تایپ کنی.`
 
 // botVersion نسخهٔ ربات است؛ هنگام انتشار نسخهٔ جدید آن را به‌روز کن
-const botVersion = "v8.4"
+const botVersion = "v8.5"
 
 const (
 	btnStatus    = "وضعیت و هزینه"
@@ -221,12 +221,8 @@ func (b *Bot) costLabel(userID int64) string {
 	defer cancel()
 	s, err := b.oc.GetSession(ctx, sid)
 	label := btnStatus
-	if err == nil {
-		if s.Cost > 0 {
-			label = "هزینه: " + b.costButton(s.Cost)
-		} else {
-			label = "هزینه: بدون مصرف"
-		}
+	if err == nil && s.Cost > 0 {
+		label = b.costButton(s.Cost)
 	}
 	b.ui.storeCost(userID, label)
 	return label
@@ -400,7 +396,7 @@ func (b *Bot) Handle(upd tgbotapi.Update) {
 		return
 	}
 	text := strings.TrimSpace(upd.Message.Text)
-	if text == btnStatus || strings.HasPrefix(text, "هزینه: ") {
+	if text == btnStatus || strings.HasPrefix(text, "$") {
 		b.showStatus(userID, chatID)
 		return
 	}
@@ -441,6 +437,8 @@ var cbRoutes = []cbRoute{
 	{prefix: "ss:", run: sessionsAction},
 	{prefix: "qa:", run: questionAction},
 	{prefix: "stop:", run: stopRunAction},
+	{prefix: "cf:", run: confirmAction},
+	{prefix: "cnt:", run: continueAction},
 }
 
 func settingsAction(b *Bot, cq *tgbotapi.CallbackQuery) {
@@ -673,8 +671,17 @@ func (b *Bot) submitPrompt(userID, chatID int64, prompt string) {
 		b.openSettings(userID, chatID)
 		return
 	}
-	if b.activeRunsOf(userID) >= maxConcurrentRuns {
-		b.send(chatID, fmt.Sprintf("بیشتر از %d اجرای هم‌زمان مجاز نیست؛ صبر کن یکی تمام شود.", maxConcurrentRuns))
+	// تک‌کاره: فقط یک کار در یک زمان؛ اگر اجرایی فعال است بپرس توقف یا ادامه
+	if b.runs.total() > 0 {
+		if b.qs.forChat(chatID) != nil {
+			b.send(chatID, "مدل سؤالی پرسیده؛ با دکمه‌های همان پیام پاسخ بده (یا ✏️ بنویس).")
+			return
+		}
+		if sid := b.runs.activeSID(); sid != "" && b.runs.approval(sid) != nil {
+			b.send(chatID, "منتظر تأیید طرح هستم؛ با دکمهٔ «✔️ شروع کن» یا «✖️ لغو» همان پیام تصمیم بگیر.")
+			return
+		}
+		b.askStopOrContinue(userID, chatID)
 		return
 	}
 	st := b.stateFor(userID, chatID)
@@ -687,42 +694,146 @@ func (b *Bot) submitPrompt(userID, chatID int64, prompt string) {
 		}
 		sid = created
 	}
-	if _, busy := b.runFor(sid); busy {
-		if b.qs.forChat(chatID) != nil {
-			b.send(chatID, "مدل سؤالی پرسیده؛ با دکمه‌های همان پیام پاسخ بده (یا ✏️ بنویس).")
-			return
-		}
-		b.send(chatID, "این نشست الان در حال اجراست.\nبا دکمهٔ 🗂 نشست‌ها یک نشست دیگر بساز یا یکی از نشست‌ها را انتخاب کن تا هم‌زمان جلو برویم.")
-		return
-	}
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &runCtl{SID: sid, UserID: userID, ChatID: chatID, cancel: cancel, done: make(chan struct{}), started: time.Now()}
 	b.addRun(r)
-	go b.runPrompt(ctx, r, prompt)
+	go b.runTask(ctx, r, prompt)
 }
 
-func (b *Bot) runPrompt(ctx context.Context, r *runCtl, prompt string) {
+// runTask کار را در دو فاز انجام می‌دهد: اول با agent=plan «طرح پیشنهادی» می‌دهد،
+// بعد از تأییدِ کاربر همان درخواست را با agent انتخابی اجرا می‌کند.
+func (b *Bot) runTask(ctx context.Context, r *runCtl, prompt string) {
 	defer b.delRun(r.SID)
 
 	agent := b.agentFor(r.UserID)
-	progressMsg, err := b.sendProgress(r.ChatID, "در حال انجام…", r.SID)
+	pre, preOK := b.sessionUsage(r.SID)
+
+	// ---------- فاز ۱: برنامه‌ریزی (بدون تغییر فایل) ----------
+	prog, err := b.sendProgress(r.ChatID, "در حال برنامه‌ریزی…", r.SID)
 	if err != nil {
 		return
 	}
+	if err := b.oc.PromptAsync(ctx, r.SID, prompt, "plan"); err != nil {
+		b.edit(r.ChatID, prog, "شروع برنامه‌ریزی ناموفق بود: "+err.Error())
+		b.removeInline(r.ChatID, prog)
+		return
+	}
+	plan := b.poll(ctx, r, prog, pre.model)
+	if plan.outcome != outcomeDone {
+		// متوقف شد / خطا در مرحلهٔ طرح
+		b.sendChunks(r.ChatID, plan.text, prog)
+		return
+	}
+	b.sendChunks(r.ChatID, plan.text, prog)
 
-	// مصرف نشست قبل از اجرا تا بعداً مصرف همین اجرا حساب شود
-	pre, preOK := b.sessionUsage(r.SID)
-
-	if err := b.oc.PromptAsync(ctx, r.SID, prompt, agent); err != nil {
-		b.edit(r.ChatID, progressMsg, "ارسال دستور ناموفق بود: "+err.Error())
-		b.removeInline(r.ChatID, progressMsg)
+	// ---------- تأیید کاربر ----------
+	if !b.askConfirm(ctx, r) {
 		return
 	}
 
-	res := b.poll(ctx, r, progressMsg, pre.model)
-	b.sendChunks(r.ChatID, res.text, progressMsg)
+	// ---------- فاز ۲: اجرا ----------
+	prog2, err := b.sendProgress(r.ChatID, "در حال انجام…", r.SID)
+	if err != nil {
+		return
+	}
+	if err := b.oc.PromptAsync(ctx, r.SID, prompt, agent); err != nil {
+		b.edit(r.ChatID, prog2, "شروع اجرا ناموفق بود: "+err.Error())
+		b.removeInline(r.ChatID, prog2)
+		return
+	}
+	res := b.poll(ctx, r, prog2, pre.model)
+	b.sendChunks(r.ChatID, res.text, prog2)
 	// پیامِ جداگانهٔ خلاصه در زیر پاسخ: کار تمام شد + مصرف توکن/هزینه + جزئیات
 	b.sendRunSummary(r, res, pre, preOK)
+}
+
+// askStopOrContinue وقتی کار دیگری در حال اجراست، از کاربر می‌پرسد اجرای فعلی
+// را متوقف کند یا ادامه دهد (پیام جدیدش الان اجرا نمی‌شود).
+func (b *Bot) askStopOrContinue(userID, chatID int64) {
+	sid := b.runs.activeSID()
+	if sid == "" {
+		return
+	}
+	r, ok := b.runs.get(sid)
+	if !ok {
+		return
+	}
+	if r.UserID != userID || r.ChatID != chatID {
+		b.send(chatID, "الان در حال انجام کار دیگری‌ام؛ چند لحظهٔ دیگر دوباره بفرست.")
+		return
+	}
+	text := "الان یک کار در حال انجام است. می‌خواهی آن را متوقف کنم یا ادامه بدهم؟\n(پیام تازه‌ات بعد از انتخاب اجرا نمی‌شود؛ باید دوباره بفرستی.)"
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyMarkup = rowsOf(
+		[]tgbotapi.InlineKeyboardButton{inlineBtn("⏹ متوقفش کن", "stop:"+sid)},
+		[]tgbotapi.InlineKeyboardButton{inlineBtn("▶️ ادامه بده", "cnt:"+sid)},
+	)
+	b.api.Send(msg)
+}
+
+// askConfirm طرح ارائه‌شده را با دکمه «شروع کن / لغو» از کاربر تأیید می‌گیرد.
+func (b *Bot) askConfirm(ctx context.Context, r *runCtl) bool {
+	ch := make(chan bool, 1)
+	b.runs.setApproval(r.SID, ch)
+	defer b.runs.clearApproval(r.SID)
+
+	msg := tgbotapi.NewMessage(r.ChatID, "این طرح را اجرا کنم؟\n(با اجرا، agent روی فایل‌ها و دستورها کار می‌کند.)")
+	msg.ReplyMarkup = rowsOf(
+		[]tgbotapi.InlineKeyboardButton{inlineBtn("✔️ شروع کن", "cf:"+r.SID+":yes")},
+		[]tgbotapi.InlineKeyboardButton{inlineBtn("✖️ لغو", "cf:"+r.SID+":no")},
+	)
+	m, err := b.api.Send(msg)
+	if err != nil {
+		return false
+	}
+
+	select {
+	case ok := <-ch:
+		title := "✖️ لغو شد."
+		if ok {
+			title = "✔️ شروع شد."
+		}
+		edit := tgbotapi.NewEditMessageText(r.ChatID, m.MessageID, title)
+		b.api.Send(edit)
+		return ok
+	case <-ctx.Done():
+		edit := tgbotapi.NewEditMessageText(r.ChatID, m.MessageID, "⛔ متوقف شد.")
+		b.api.Send(edit)
+		return false
+	case <-time.After(3 * time.Minute):
+		edit := tgbotapi.NewEditMessageText(r.ChatID, m.MessageID, "⏳ تأییدی دریافت نشد؛ کار لغو شد.")
+		b.api.Send(edit)
+		return false
+	}
+}
+
+// confirmAction دکمهٔ تأیید/لغو طرح (cf:<sid>:yes|no) را پردازش می‌کند.
+func confirmAction(b *Bot, cq *tgbotapi.CallbackQuery) {
+	parts := strings.SplitN(cq.Data, ":", 3)
+	if len(parts) != 3 {
+		return
+	}
+	sid := parts[1]
+	r, ok := b.runs.get(sid)
+	if !ok {
+		return
+	}
+	if r.ChatID != cq.Message.Chat.ID || r.UserID != cq.From.ID {
+		return
+	}
+	ch := b.runs.approval(sid)
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- parts[2] == "yes":
+	default:
+	}
+}
+
+// continueAction دکمهٔ «ادامه بده» اجرای در جریان را دست نمی‌زند.
+func continueAction(b *Bot, cq *tgbotapi.CallbackQuery) {
+	b.send(cq.Message.Chat.ID, "باشد؛ ادامه می‌دهم. وقتی تمام شد، پیامت را دوباره بفرست.")
 }
 
 // sessionUsage آمار فعلی مصرف نشست را از سرور می‌خواند.
