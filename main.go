@@ -29,6 +29,8 @@ func main() {
 	if err := bot.loadStates(); err != nil {
 		slog.Warn("بارگذاری state ناموفق بود", "error", err)
 	}
+	// نرخ دلار→تومان: یک بار در شروع و بعد هر ۲۴ ساعت به‌روزرسانی می‌شود
+	go bot.fx.keepWarm()
 	// پیش‌بارگذاری کاتالوگ مدل‌ها تا اولین باز شدن تنظیمات معطل نکند
 	go func() {
 		if _, err := bot.cat.providers(); err != nil {

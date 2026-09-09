@@ -101,6 +101,7 @@ type Bot struct {
 	ui    *uiState   // داده‌های گذرای رابط کاربری (صفحه‌ها/حالت گروهی/کش هزینه)
 	runs  *runManager
 	qs    *qReg // سؤال‌های تعاملی در انتظار پاسخ
+	fx    *fxStore
 
 	cat *modelCatalog // کاتالوگ مدل‌ها (models.dev) با کش
 }
@@ -114,6 +115,7 @@ func newBot(cfg *Config, api telegramAPI) *Bot {
 		ui:    newUIState(),
 		runs:  newRunManager(),
 		qs:    newQReg(),
+		fx:    newFXStore(),
 		cat:   newModelCatalog(filepath.Join(filepath.Dir(cfg.StateFile), "catalog-models.json")),
 	}
 }
@@ -220,11 +222,10 @@ func (b *Bot) costLabel(userID int64) string {
 	s, err := b.oc.GetSession(ctx, sid)
 	label := btnStatus
 	if err == nil {
-		total := s.Tokens.Input + s.Tokens.Output
-		if s.Cost == 0 && total == 0 {
-			label = "📊 هزینه $0 · بدون مصرف"
+		if s.Cost > 0 {
+			label = "📊 " + b.costButton(s.Cost)
 		} else {
-			label = fmt.Sprintf("📊 $%.4f · %s توکن", s.Cost, abbrev(total))
+			label = "📊 هزینه $0 · بدون مصرف"
 		}
 	}
 	b.ui.storeCost(userID, label)
@@ -603,7 +604,7 @@ func (b *Bot) listSessions(chatID int64) {
 		if len([]rune(title)) > 40 {
 			title = string([]rune(title)[:40]) + "…"
 		}
-		fmt.Fprintf(&sb, "\n%s\n  %s\n  هزینه: $%.4f", s.ID, title, s.Cost)
+		fmt.Fprintf(&sb, "\n%s\n  %s\n  هزینه: %s", s.ID, title, b.costText(s.Cost))
 	}
 	b.send(chatID, sb.String())
 }
@@ -631,7 +632,7 @@ func (b *Bot) showStatus(userID, chatID int64) {
 	msg += fmt.Sprintf("توکن ورودی: %d\n", s.Tokens.Input)
 	msg += fmt.Sprintf("توکن خروجی: %d\n", s.Tokens.Output)
 	msg += fmt.Sprintf("جمع توکن: %s\n", abbrev(s.Tokens.Input+s.Tokens.Output))
-	msg += fmt.Sprintf("هزینه: $%.4f", s.Cost)
+	msg += fmt.Sprintf("هزینه: %s", b.costText(s.Cost))
 	b.send(chatID, msg)
 }
 
@@ -785,7 +786,7 @@ func (b *Bot) sendRunSummary(r *runCtl, res pollResult, pre usage, preOK bool) {
 	fmt.Fprintf(&sb, "⏱ مدت: %s\n", durText(secs))
 	if curOK {
 		fmt.Fprintf(&sb, "🔢 توکن: ورودی %s · خروجی %s\n", abbrev(in), abbrev(out))
-		fmt.Fprintf(&sb, "💵 هزینه: $%.4f", cost)
+		fmt.Fprintf(&sb, "💵 هزینه: %s", b.costText(cost))
 	} else {
 		sb.WriteString("💵 آمار هزینه در دسترس نبود")
 	}
