@@ -43,7 +43,7 @@ const helpText = `ربات کنترل opencode روی سرور
 اگر مدل در میانهٔ کار سؤالی بپرسد (مثل خود CLI)، همان پیام گزینه‌ها را دارد؛ با دکمه‌ها پاسخ بده تا اجرا ادامه یابد. ✏️ یعنی می‌توانی پاسخ خودت را تایپ کنی.`
 
 // botVersion نسخهٔ ربات است؛ هنگام انتشار نسخهٔ جدید آن را به‌روز کن
-const botVersion = "v8.1"
+const botVersion = "v8.2"
 
 const (
 	btnStatus    = "📊 وضعیت و هزینه"
@@ -61,7 +61,7 @@ const (
 	// نمایش «🗂 نشست‌ها» مستقیماً از سرور opencode (نه فقط فهرست محلی ربات)
 	maxTrackedSessions = 80  // حداکثر نشستی که ربات در state نگه می‌دارد
 	sessionsFetchMax   = 300 // چند نشست اخیر سرور برای همگام‌سازی واکشی شود
-	sessionsPageSize   = 6   // هر صفحه از مدیر نشست‌ها چند نشست نشان دهد
+	sessionsPageSize   = 10  // هر صفحه از مدیر نشست‌ها چند نشست نشان دهد
 )
 
 type UserState struct {
@@ -99,10 +99,12 @@ type Bot struct {
 	qmap map[string]*pendingQ // توکن کوتاه → سؤال در انتظار پاسخ
 	qseq int64
 
-	cat *modelCatalog       // کاتالوگ مدل‌ها (models.dev) با کش
-	mlc map[int64]modelsCtx // صفحهٔ مدل‌های بازشده برای هر چت
-	scx map[int64]searchCtx // نتایج جست‌وجوی باز برای هر چت
-	ssp map[int64]int       // آخرین صفحهٔ باز «🗂 نشست‌ها» برای هر چت
+	cat *modelCatalog             // کاتالوگ مدل‌ها (models.dev) با کش
+	mlc map[int64]modelsCtx       // صفحهٔ مدل‌های بازشده برای هر چت
+	scx map[int64]searchCtx       // نتایج جست‌وجوی باز برای هر چت
+	ssp map[int64]int             // آخرین صفحهٔ باز «🗂 نشست‌ها» برای هر چت
+	gsm map[int64]bool            // حالت انتخاب گروهی برای هر چت فعال است؟
+	gsl map[int64]map[string]bool // sid های انتخاب‌شده در حالت گروهی برای هر چت
 }
 
 type costInfo struct {
@@ -124,6 +126,8 @@ func newBot(cfg *Config, api *tgbotapi.BotAPI) *Bot {
 		mlc:    map[int64]modelsCtx{},
 		scx:    map[int64]searchCtx{},
 		ssp:    map[int64]int{},
+		gsm:    map[int64]bool{},
+		gsl:    map[int64]map[string]bool{},
 	}
 }
 
@@ -1080,6 +1084,73 @@ func (b *Bot) setSSPage(chatID int64, page int) {
 	b.ssp[chatID] = page
 }
 
+func (b *Bot) setGroupMode(chatID int64, on bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.gsm == nil {
+		b.gsm = map[int64]bool{}
+	}
+	b.gsm[chatID] = on
+}
+
+func (b *Bot) groupMode(chatID int64) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.gsm == nil {
+		return false
+	}
+	return b.gsm[chatID]
+}
+
+func (b *Bot) groupSel(chatID int64, sid string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.gsl == nil {
+		return false
+	}
+	return b.gsl[chatID][sid]
+}
+
+func (b *Bot) toggleGroupSel(chatID int64, sid string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.gsl == nil {
+		b.gsl = map[int64]map[string]bool{}
+	}
+	if b.gsl[chatID] == nil {
+		b.gsl[chatID] = map[string]bool{}
+	}
+	if b.gsl[chatID][sid] {
+		delete(b.gsl[chatID], sid)
+	} else {
+		b.gsl[chatID][sid] = true
+	}
+}
+
+func (b *Bot) clearGroupSel(chatID int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.gsl != nil {
+		delete(b.gsl, chatID)
+	}
+}
+
+func (b *Bot) groupSelCount(chatID int64) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.gsl[chatID])
+}
+
+func (b *Bot) groupSelList(chatID int64) []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var out []string
+	for sid := range b.gsl[chatID] {
+		out = append(out, sid)
+	}
+	return out
+}
+
 // sessionsAtSamePage مدیر نشست‌ها را در همان صفحهٔ قبلی دوباره باز می‌کند
 func (b *Bot) sessionsAtSamePage(userID, chatID int64, msgID int) {
 	b.sessionsPage(userID, chatID, msgID, b.lastSSPage(chatID))
@@ -1234,6 +1305,14 @@ func (b *Bot) sessionsPage(userID, chatID int64, msgID, page int) {
 	if pages > 1 {
 		fmt.Fprintf(&sb, "  (صفحه %s از %s)", faNum(page+1), faNum(pages))
 	}
+	group := b.groupMode(chatID)
+	if group {
+		if n := b.groupSelCount(chatID); n > 0 {
+			fmt.Fprintf(&sb, "  — 🔀 %s نشست انتخاب شده", faNum(n))
+		} else {
+			sb.WriteString("  — 🔀 حالت انتخاب گروهی")
+		}
+	}
 	sb.WriteString("\n")
 	if warn != nil {
 		sb.WriteString("⚠️ سرور در دسترس نبود؛ نشست‌های ذخیره‌شده نمایش داده می‌شود.\n")
@@ -1243,6 +1322,9 @@ func (b *Bot) sessionsPage(userID, chatID int64, msgID, page int) {
 		_, running := b.runFor(sid)
 		name := b.sessionLabel(st, sid)
 		line := fmt.Sprintf("<b>%s</b>  `%s`", name, shortSID(sid))
+		if group && b.groupSel(chatID, sid) {
+			line = "☑️ " + line
+		}
 		if sid == active {
 			line += "  ← فعال"
 		}
@@ -1251,12 +1333,24 @@ func (b *Bot) sessionsPage(userID, chatID int64, msgID, page int) {
 		}
 		sb.WriteString(line + "\n")
 	}
-	sb.WriteString("\nفهرست همان نشست‌های واقعی سرور است؛ 🗑 نشست را روی سرور هم برای همیشه حذف می‌کند.")
+	if group {
+		sb.WriteString("\nروی هر نشست بزن تا انتخاب/لغو شود، بعد «🗑 حذف انتخاب‌ها» را بزن.")
+	} else {
+		sb.WriteString("\nفهرست همان نشست‌های واقعی سرور است؛ 🗑 نشست را روی سرور هم برای همیشه حذف می‌کند.")
+	}
 
 	var rows [][]tgbotapi.InlineKeyboardButton
 	for i := start; i < end; i++ {
 		sid := ids[i]
 		label := b.sessionLabel(st, sid)
+		if group {
+			mark := "☑️"
+			if b.groupSel(chatID, sid) {
+				mark = "✅"
+			}
+			rows = append(rows, []tgbotapi.InlineKeyboardButton{inlineBtn(mark+" "+clipHead(label, 24), "ss:gtgl:"+sid)})
+			continue
+		}
 		row := []tgbotapi.InlineKeyboardButton{}
 		if sid == active {
 			row = append(row, inlineBtn("✓ "+clipHead(label, 18), "ss:noop"))
@@ -1285,9 +1379,21 @@ func (b *Bot) sessionsPage(userID, chatID int64, msgID, page int) {
 		}
 		rows = append(rows, nav)
 	}
+	if group {
+		del := "🗑 حذف انتخاب‌ها"
+		if n := b.groupSelCount(chatID); n > 0 {
+			del = "🗑 حذف انتخاب‌ها (" + faNum(n) + ")"
+		}
+		rows = append(rows, []tgbotapi.InlineKeyboardButton{inlineBtn(del, "ss:gdel"), inlineBtn("✖️ لغو حالت گروهی", "ss:gcncl")})
+	}
 	rows = append(rows,
 		[]tgbotapi.InlineKeyboardButton{inlineBtn("➕ نشست جدید", "ss:new"), inlineBtn("🔄 تازه‌سازی", "ss:refresh"), inlineBtn("❌ بستن", "ss:close")},
 	)
+	if !group {
+		rows = append(rows,
+			[]tgbotapi.InlineKeyboardButton{inlineBtn("🔀 عملیات گروهی", "ss:gm")},
+		)
+	}
 
 	kb := rowsOf(rows...)
 	if msgID == 0 {
@@ -1323,6 +1429,16 @@ func (b *Bot) onSessionsCallback(userID, chatID int64, msgID int, data string) {
 		st := b.stateFor(userID, chatID)
 		b.send(chatID, "✅ نشست جدید ساخته و فعال شد:\n"+b.sessionLabel(st, s.ID)+"\n"+s.ID)
 		b.sessionsAtSamePage(userID, chatID, msgID)
+	case "ss:gm":
+		b.setGroupMode(chatID, true)
+		b.clearGroupSel(chatID)
+		b.sessionsAtSamePage(userID, chatID, msgID)
+	case "ss:gcncl":
+		b.setGroupMode(chatID, false)
+		b.clearGroupSel(chatID)
+		b.sessionsAtSamePage(userID, chatID, msgID)
+	case "ss:gdel":
+		b.openGroupDeleteConfirm(userID, chatID, msgID)
 	default:
 		parts := strings.SplitN(data, ":", 3)
 		if len(parts) < 3 {
@@ -1365,6 +1481,11 @@ func (b *Bot) onSessionsCallback(userID, chatID int64, msgID int, data string) {
 			b.deleteSession(userID, sid)
 			b.send(chatID, "🗑 نشست از روی سرور حذف شد.")
 			b.sessionsAtSamePage(userID, chatID, msgID)
+		case "gtgl":
+			b.toggleGroupSel(chatID, parts[2])
+			b.sessionsAtSamePage(userID, chatID, msgID)
+		case "gdelc":
+			b.deleteGroupSessions(userID, chatID, msgID)
 		case "stop":
 			if b.stopRun(parts[2]) {
 				b.send(chatID, "اجرای نشست متوقف شد.")
@@ -1372,6 +1493,73 @@ func (b *Bot) onSessionsCallback(userID, chatID int64, msgID int, data string) {
 			b.sessionsAtSamePage(userID, chatID, msgID)
 		}
 	}
+}
+
+// openGroupDeleteConfirm تأیید حذف دسته‌جمعی نشست‌های انتخاب‌شده را نشان می‌دهد
+func (b *Bot) openGroupDeleteConfirm(userID, chatID int64, msgID int) {
+	sids := b.groupSelList(chatID)
+	if len(sids) == 0 {
+		edit := tgbotapi.NewEditMessageText(chatID, msgID, "هیچ نشستی انتخاب نشده. روی نشست‌ها بزن تا انتخاب شوند.")
+		edit.ReplyMarkup = rowsOf([]tgbotapi.InlineKeyboardButton{inlineBtn("🔄 بازگشت", "ss:refresh")})
+		b.api.Send(edit)
+		return
+	}
+	st := b.stateFor(userID, chatID)
+	var names []string
+	for i, sid := range sids {
+		if i >= 8 {
+			names = append(names, "…")
+			break
+		}
+		names = append(names, "• "+b.sessionLabel(st, sid))
+	}
+	text := fmt.Sprintf("🗑 <b>%s نشست</b> برای همیشه حذف شوند؟\nاین نشست‌ها و تمام گفتگویشان از روی سرور opencode پاک می‌شود (غیرقابل بازگشت). اجرای در جریان هم متوقف می‌شود.\n\n%s", faNum(len(sids)), strings.Join(names, "\n"))
+	edit := tgbotapi.NewEditMessageText(chatID, msgID, text)
+	edit.ParseMode = "HTML"
+	edit.ReplyMarkup = rowsOf(
+		[]tgbotapi.InlineKeyboardButton{inlineBtn("🗑 بله، همه را حذف کن", "ss:gdelc")},
+		[]tgbotapi.InlineKeyboardButton{inlineBtn("انصراف", "ss:refresh")},
+	)
+	b.api.Send(edit)
+}
+
+// deleteGroupSessions نشست‌های انتخاب‌شده را یک‌به‌یک روی سرور حذف می‌کند
+func (b *Bot) deleteGroupSessions(userID, chatID int64, msgID int) {
+	sids := b.groupSelList(chatID)
+	if len(sids) == 0 {
+		b.sessionsAtSamePage(userID, chatID, msgID)
+		return
+	}
+	b.clearGroupSel(chatID)
+	b.setGroupMode(chatID, false)
+	b.edit(chatID, msgID, "در حال حذف "+faNum(len(sids))+" نشست…")
+
+	ok, fail := 0, 0
+	var errMsg []string
+	for _, sid := range sids {
+		b.stopRun(sid)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		err := b.oc.DeleteSession(ctx, sid)
+		cancel()
+		if err != nil {
+			fail++
+			if len(errMsg) < 3 {
+				errMsg = append(errMsg, "• "+shortSID(sid)+": "+err.Error())
+			}
+			continue
+		}
+		b.deleteSession(userID, sid)
+		ok++
+	}
+	text := fmt.Sprintf("🗑 حذف گروهی انجام شد: %s نشست حذف شد.", faNum(ok))
+	if fail > 0 {
+		text += fmt.Sprintf("\n⚠️ %s نشست حذف نشد.", faNum(fail))
+		if len(errMsg) > 0 {
+			text += "\n" + strings.Join(errMsg, "\n")
+		}
+	}
+	b.send(chatID, text)
+	b.sessionsPage(userID, chatID, msgID, 0)
 }
 
 func isFinalFinish(finish string) bool {
