@@ -4,10 +4,20 @@
 #
 # اجرا:
 #   از داخل پوشه پروژه:            sudo bash install.sh
-#   یا یک‌خطی از گیت‌هاب:          sudo bash <(curl -fsSL https://raw.githubusercontent.com/Aknuun/GAZAN-opencode-bot/master/install.sh)
+#   یا یک‌خطی از گیت‌هاب:
+#     curl -fsSL https://raw.githubusercontent.com/Aknuun/GAZAN-opencode-bot/master/install.sh -o /tmp/opencode-tg-install.sh \
+#       && sudo bash /tmp/opencode-tg-install.sh
+#
+#   ⚠️ با «sudo bash <(curl …)» اجرا نکن: sudo فایل‌دسکریپتورِ process
+#   substitution را نمی‌دهد و اجرا با «/dev/fd/63: No such file or directory»
+#   متوقف می‌شود. همین‌طور اسکریپتِ interactive را از لولهٔ «curl | sudo bash»
+#   اجرا نکن، چون stdin دیگر ترمینال نیست و پرسش‌ها خوانده نمی‌شوند.
+#   (خودِ اسکریپت در این حالت از /dev/tty می‌خواند؛ ولی راهِ امن همان دانلود است.)
 #
 # اگر قبلاً نصب شده باشد، به‌جای نصبِ دوباره، «آپدیت» انجام می‌دهد
 # (دریافت آخرین نسخه + build + ری‌استارت) بدون اینکه توکن/آیدی را دوباره بپرسد.
+# برای نصبِ غیرتعاملی (بدون ترمینال) مقادیر را از قبل با متغیر محیطی ست کن:
+#   TELEGRAM_BOT_TOKEN=... ALLOWED_USER_IDS=... sudo bash install.sh
 #
 set -euo pipefail
 
@@ -64,15 +74,31 @@ read_env() { # key -> مقدار (بدون مقدار پیش‌فرض)
 }
 
 # ---------- اطلاعات پایه ----------
-BOT_TOKEN="$(read_env TELEGRAM_BOT_TOKEN)"
-ALLOWED="$(read_env ALLOWED_USER_IDS)"
-PORT="$(read_env OPENCODE_BASE_URL | sed -E 's|.*:([0-9]+)$|\1|' || true)"
+# اولویت: متغیر محیطی > فایل .env  (این‌طوری می‌شود غیرتعاملی هم نصب کرد)
+BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-$(read_env TELEGRAM_BOT_TOKEN)}"
+ALLOWED="${ALLOWED_USER_IDS:-$(read_env ALLOWED_USER_IDS)}"
+PORT="${OPENCODE_TG_PORT:-$(read_env OPENCODE_BASE_URL | sed -E 's|.*:([0-9]+)$|\1|' || true)}"
+
+ask() { # $1: نام متغیر   $2: پیام — تا پر شدن مقدار می‌پرسد.
+  # اگر stdin ترمینال نیست (مثل curl … | sudo bash) از /dev/tty می‌خواند؛
+  # اگر اصلاً ترمینالی در دسترس نبود، با پیامِ واضح می‌ایستد به‌جای چرخش بی‌نهایت.
+  local var="$1" label="$2"
+  while [[ -z "${!var:-}" ]]; do
+    if [[ -e /dev/tty ]]; then
+      if ! read -r -p "$label " "$var" < /dev/tty; then
+        c_err "خواندن از ترمینال ممکن نشد (stdin بسته است)."
+        die "برای نصبِ بدون ترمینال، مقدار را از قبل ست کن:  ${var}=مقدار  سپس  sudo bash install.sh"
+      fi
+    else
+      c_err "ترمینال در دسترس نیست (stdin بسته است)."
+      die "برای نصبِ بدون ترمینال، مقدار را از قبل ست کن:  ${var}=مقدار  سپس  sudo bash install.sh"
+    fi
+  done
+}
 
 if [[ "$MODE" == "install" ]]; then
   c_ok "== نصب جدید =="
-  while [[ -z "$BOT_TOKEN" ]]; do
-    read -r -p "① توکن ربات تلگرام (از @BotFather بگیر): " BOT_TOKEN
-  done
+  ask BOT_TOKEN "① توکن ربات تلگرام (از @BotFather بگیر):"
   ok="$(curl -fsS --max-time 15 "https://api.telegram.org/bot${BOT_TOKEN}/getMe" 2>/dev/null | grep -o '"username":"[^"]*"' || true)"
   if [[ -z "$ok" ]]; then
     c_err "توکن معتبر نیست (تلگرام جواب نداد)."
@@ -80,16 +106,9 @@ if [[ "$MODE" == "install" ]]; then
   fi
   c_ok "توکن تأیید شد: $ok"
 
-  while [[ -z "$ALLOWED" ]]; do
-    read -r -p "② آیدی عددی تلگرام کاربران مجاز (چندتا با کاما؛ از @userinfobot): " ALLOWED
-  done
-  [[ -z "$ALLOWED" ]] && die "حداقل یک آیدی عددی لازم است."
+  ask ALLOWED "② آیدی عددی تلگرام کاربران مجاز (چندتا با کاما؛ از @userinfobot):"
   c_ok "کاربران مجاز: $ALLOWED"
-
-  if [[ -z "$PORT" ]]; then
-    read -r -p "پورت سرور opencode [پیش‌فرض 17890]: " PORT
-    PORT="${PORT:-17890}"
-  fi
+  PORT="${PORT:-17890}"
 else
   c_ok "== آپدیت (نصب قبلی پیدا شد) =="
   [[ -z "$BOT_TOKEN" ]] && die "فایل .env معتبر نیست؛ آن را دستی چک کن."

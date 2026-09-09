@@ -28,7 +28,15 @@ A Telegram bridge for a headless opencode server running on your own VPS.
 ## نصب (یک‌دستوری)
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/Aknuun/GAZAN-opencode-bot/master/install.sh)
+curl -fsSL https://raw.githubusercontent.com/Aknuun/GAZAN-opencode-bot/master/install.sh -o /tmp/opencode-tg-install.sh && sudo bash /tmp/opencode-tg-install.sh
+```
+
+> ⚠️ از `sudo bash <(curl …)` استفاده نکن — `sudo` به فایل‌دسکریپتورِ process substitution دسترسی نمی‌دهد و با خطای `/dev/fd/63: No such file or directory` متوقف می‌شود. باید اسکریپت را اول دانلود و بعد با `sudo bash` اجرا کنی تا پرسش‌ها (توکن/آیدی) روی ترمینال خوانده شوند.
+
+نصب بدون ترمینال (غیرتعاملی، برای اسکریپت/اتوماسیون):
+
+```bash
+TELEGRAM_BOT_TOKEN="توکن" ALLOWED_USER_IDS="123,456" sudo bash /tmp/opencode-tg-install.sh
 ```
 
 نصب‌کننده:
