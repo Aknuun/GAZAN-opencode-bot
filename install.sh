@@ -4,7 +4,7 @@
 #
 # اجرا:
 #   از داخل پوشه پروژه:            sudo bash install.sh
-#   یا یک‌خطی از گیت‌هاب:          sudo bash <(curl -fsSL https://raw.githubusercontent.com/Aknuun/GAZAN-opencode-bot/main/install.sh)
+#   یا یک‌خطی از گیت‌هاب:          sudo bash <(curl -fsSL https://raw.githubusercontent.com/Aknuun/GAZAN-opencode-bot/master/install.sh)
 #
 # اگر قبلاً نصب شده باشد، به‌جای نصبِ دوباره، «آپدیت» انجام می‌دهد
 # (دریافت آخرین نسخه + build + ری‌استارت) بدون اینکه توکن/آیدی را دوباره بپرسد.
@@ -45,7 +45,7 @@ else
   SRC="$TARGET"
   c_warn "دریافت سورس از گیت‌هاب ($REPO)…"
   mkdir -p "$SRC"
-  curl -fsSL "https://github.com/$REPO/archive/refs/heads/main.tar.gz" -o /tmp/$APP-src.tar.gz
+  curl -fsSL "https://github.com/$REPO/archive/refs/heads/master.tar.gz" -o /tmp/$APP-src.tar.gz
   tar xzf /tmp/$APP-src.tar.gz -C "$SRC" --strip-components=1
   rm -f /tmp/$APP-src.tar.gz
 fi
@@ -53,7 +53,7 @@ fi
 # در حالت آپدیت، اگر سورس محلیِ جدا داریم، آخرین نسخه را می‌گیریم
 if [[ "$MODE" == "update" && "${OPENCODE_TG_SKIP_FETCH:-0}" != "1" && ! -f "$SCRIPT_DIR/main.go" ]]; then
   c_warn "دریافت آخرین نسخه…"
-  curl -fsSL "https://github.com/$REPO/archive/refs/heads/main.tar.gz" -o /tmp/$APP-src.tar.gz
+  curl -fsSL "https://github.com/$REPO/archive/refs/heads/master.tar.gz" -o /tmp/$APP-src.tar.gz
   tar xzf /tmp/$APP-src.tar.gz -C "$SRC" --strip-components=1
   rm -f /tmp/$APP-src.tar.gz
 fi

@@ -28,7 +28,7 @@ A Telegram bridge for a headless opencode server running on your own VPS.
 ## نصب (یک‌دستوری)
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/Aknuun/GAZAN-opencode-bot/main/install.sh)
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/Aknuun/GAZAN-opencode-bot/master/install.sh)
 ```
 
 نصب‌کننده:
