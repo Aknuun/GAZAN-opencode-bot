@@ -394,22 +394,13 @@ func (b *Bot) handlePending(userID, chatID int64, pending, text string) {
 		}
 		b.qSendEvent(p, qEvent{kind: qEvText, text: text})
 	case "rn":
-		// تغییر نام (عنوان فارسی) یک نشست
+		// تغییر نام (با ✏️) یک نشست؛ نام دستی تا حذف نشست باقی می‌ماند
 		sid := arg
 		if sid == "" {
 			b.send(chatID, "نشست مشخص نیست.")
 			return
 		}
-		b.mu.Lock()
-		st2 := b.states[userID]
-		if st2 != nil {
-			if st2.Labels == nil {
-				st2.Labels = map[string]string{}
-			}
-			st2.Labels[sid] = text
-			b.saveStates()
-		}
-		b.mu.Unlock()
+		b.setSessionLabel(userID, sid, text)
 		b.send(chatID, "✅ نام نشست عوض شد:\n"+text)
 	case "model":
 		full := text

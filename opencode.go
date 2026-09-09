@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -156,6 +157,20 @@ func (c *OCClient) LastMessage(ctx context.Context, sessionID string) (*OCMessag
 		return nil, nil
 	}
 	return &list[0], nil
+}
+
+// ListMessages فهرست پیام‌های نشست (قدیمی→جدید)؛ limit تعداد پیام‌های آخر
+func (c *OCClient) ListMessages(ctx context.Context, sessionID string, limit int) ([]OCMessage, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	var list []OCMessage
+	err := c.doJSON(ctx, http.MethodGet,
+		"/session/"+url.PathEscape(sessionID)+"/message?limit="+strconv.Itoa(limit), nil, &list)
+	if err != nil {
+		return nil, err
+	}
+	return list, nil
 }
 
 func (c *OCClient) Abort(ctx context.Context, sessionID string) error {

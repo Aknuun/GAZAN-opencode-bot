@@ -30,7 +30,7 @@ const helpText = `ربات کنترل opencode روی سرور
 
 دستورات:
 /new         ساخت نشست جدید و رفتن به آن
-/use <id>    رفتن به نشست مشخص
+/use <id>    رفتن به نشست مشخص (با فهرست موضوعاتش)
 /sessions    باز کردن مدیریت نشست‌ها
 /list        فهرست نشست‌های اخیر سرور
 /status      جزئیات نشست فعال
@@ -58,7 +58,8 @@ type UserState struct {
 	ChatID    int64             `json:"chat_id"`
 	SessionID string            `json:"session_id,omitempty"`
 	Sessions  []string          `json:"sessions,omitempty"`
-	Labels    map[string]string `json:"labels,omitempty"` // نام فارسی نشست‌ها
+	Labels    map[string]string `json:"labels,omitempty"` // نام نمایشی نشست‌ها
+	Manual    map[string]bool   `json:"manual,omitempty"` // نشست‌هایی که کاربر با ✏️ دستی نامشان را عوض کرده
 	Agent     string            `json:"agent,omitempty"`
 	Pending   string            `json:"pending,omitempty"`
 }
@@ -126,7 +127,7 @@ func (b *Bot) loadStates() error {
 	return nil
 }
 
-// normalizeStates برچسب‌های پیش‌فرض برای نشست‌های قدیمی/بدون نام می‌سازد
+// normalizeStates نام پیش‌فرض نشست‌ها را شماره می‌کند (۱، ۲، ۳…)
 func (b *Bot) normalizeStates() {
 	for _, st := range b.states {
 		if st.Labels == nil {
@@ -136,17 +137,39 @@ func (b *Bot) normalizeStates() {
 		if st.SessionID != "" {
 			st.Sessions = addSessionID(st.Sessions, st.SessionID)
 		}
-		for i, sid := range st.Sessions {
-			if st.Labels[sid] == "" {
-				st.Labels[sid] = defaultSessionName(i + 1)
-			}
-		}
+		renumberAutoLabels(st)
 	}
 	b.saveStates()
 }
 
+// defaultSessionName نام پیش‌فرض نشست: فقط شماره (۱، ۲، ۳…)
 func defaultSessionName(n int) string {
-	return fmt.Sprintf("نشست %d", n)
+	return faNum(n)
+}
+
+// faNum اعداد را به رقم فارسی تبدیل می‌کند
+func faNum(n int) string {
+	r := []rune(strconv.Itoa(n))
+	for i, c := range r {
+		if c >= '0' && c <= '9' {
+			r[i] = '۰' + (c - '0')
+		}
+	}
+	return string(r)
+}
+
+// renumberAutoLabels نشست‌های بدون نام دستی را بر اساس جایگاهشان شماره‌گذاری می‌کند
+// (نام‌هایی که کاربر با ✏️ گذاشته دست‌نخورده می‌مانند)
+func renumberAutoLabels(st *UserState) {
+	if st.Labels == nil {
+		st.Labels = map[string]string{}
+	}
+	for i, sid := range st.Sessions {
+		if st.Manual != nil && st.Manual[sid] {
+			continue
+		}
+		st.Labels[sid] = defaultSessionName(i + 1)
+	}
 }
 
 // sessionLabel نام نمایشی نشست
@@ -231,7 +254,7 @@ func addSessionID(list []string, id string) []string {
 	return append(list, id)
 }
 
-// setSessionLabel نام (عنوان موضوعی) نشست را به‌روز می‌کند
+// setSessionLabel نام دستی (با ✏️) نشست را به‌روز می‌کند
 func (b *Bot) setSessionLabel(userID int64, sid, label string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -242,7 +265,11 @@ func (b *Bot) setSessionLabel(userID int64, sid, label string) {
 	if st.Labels == nil {
 		st.Labels = map[string]string{}
 	}
+	if st.Manual == nil {
+		st.Manual = map[string]bool{}
+	}
 	st.Labels[sid] = label
+	st.Manual[sid] = true
 	b.saveStates()
 }
 
@@ -265,9 +292,13 @@ func (b *Bot) deleteSession(userID int64, sid string) {
 	if st.Labels != nil {
 		delete(st.Labels, sid)
 	}
+	if st.Manual != nil {
+		delete(st.Manual, sid)
+	}
 	if st.SessionID == sid {
 		st.SessionID = ""
 	}
+	renumberAutoLabels(st)
 	b.saveStates()
 }
 
@@ -561,7 +592,7 @@ func (b *Bot) Handle(upd tgbotapi.Update) {
 		b.handleCommand(upd, text)
 		return
 	}
-	b.submitPrompt(userID, chatID, text, autoLabel(text))
+	b.submitPrompt(userID, chatID, text)
 }
 
 func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
@@ -593,49 +624,15 @@ func (b *Bot) handleFile(userID, chatID int64, fileID, fileName, caption string,
 		b.send(chatID, "دریافت فایل ناموفق بود: "+err.Error())
 		return
 	}
-	label := ""
 	prompt := strings.TrimSpace(caption)
 	if prompt == "" {
 		if isPhoto {
-			label = "📷 تحلیل تصویر"
 			prompt = "این تصویر پیوست‌شده را تحلیل کن و نتیجه را گزارش بده."
 		} else {
-			label = "📄 بررسی " + fileBase(fileName)
 			prompt = "محتوای این فایل پیوست‌شده را بررسی کن و خلاصه یا پاسخ مناسب بده."
 		}
-	} else {
-		label = autoLabel(prompt)
 	}
-	if label == "" {
-		label = autoLabel(prompt)
-	}
-	b.submitPrompt(userID, chatID, prompt+"\n\nفایل پیوست: "+path, label)
-}
-
-func fileBase(name string) string {
-	name = filepath.Base(name)
-	if len([]rune(name)) > 24 {
-		name = string([]rune(name)[:24]) + "…"
-	}
-	return name
-}
-
-// autoLabel نام خودکار نشست از روی موضوع آخرین پیام کاربر
-func autoLabel(prompt string) string {
-	p := strings.TrimSpace(prompt)
-	if i := strings.Index(p, "\n\nفایل پیوست:"); i > 0 {
-		p = strings.TrimSpace(p[:i])
-	}
-	p = strings.Join(strings.Fields(p), " ")
-	r := []rune(p)
-	if len(r) == 0 {
-		return "گفتگو"
-	}
-	const max = 34
-	if len(r) > max {
-		return string(r[:max]) + "…"
-	}
-	return p
+	b.submitPrompt(userID, chatID, prompt+"\n\nفایل پیوست: "+path)
 }
 
 func (b *Bot) download(fileID, fileName string) (string, error) {
@@ -697,9 +694,7 @@ func (b *Bot) handleCommand(upd tgbotapi.Update, text string) {
 			b.send(chatID, "استفاده: /use <session id>")
 			return
 		}
-		b.setSession(userID, arg)
-		st := b.stateFor(userID, chatID)
-		b.send(chatID, "نشست فعال شد:\n"+b.sessionLabel(st, arg)+"\n"+arg)
+		b.useSession(userID, chatID, arg)
 	case "/list":
 		b.listSessions(chatID)
 	case "/status":
@@ -813,7 +808,7 @@ func (b *Bot) abortAllRuns() {
 
 // ---------- ارسال پرامپت و اجرا ----------
 
-func (b *Bot) submitPrompt(userID, chatID int64, prompt, label string) {
+func (b *Bot) submitPrompt(userID, chatID int64, prompt string) {
 	if !b.ocReady() {
 		b.send(chatID, b.ocSetupHint())
 		b.openSettings(userID, chatID)
@@ -842,11 +837,6 @@ func (b *Bot) submitPrompt(userID, chatID int64, prompt, label string) {
 		b.send(chatID, "این نشست الان در حال اجراست.\nبا دکمهٔ 🗂 نشست‌ها یک نشست دیگر بساز یا یکی از نشست‌ها را انتخاب کن تا هم‌زمان جلو برویم.")
 		return
 	}
-	// نام نشست از روی آخرین موضوع
-	if label == "" {
-		label = autoLabel(prompt)
-	}
-	b.setSessionLabel(userID, sid, label)
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &runCtl{SID: sid, UserID: userID, ChatID: chatID, cancel: cancel, done: make(chan struct{}), started: time.Now()}
 	b.addRun(r)
@@ -958,6 +948,66 @@ func (b *Bot) sessionLine(st *UserState, sid string) string {
 	return line
 }
 
+// useSession نشست را فعال می‌کند و فهرست موضوعات مطرح‌شده در آن را نشان می‌دهد
+func (b *Bot) useSession(userID, chatID int64, sid string) {
+	b.setSession(userID, sid)
+	st := b.stateFor(userID, chatID)
+	name := b.sessionLabel(st, sid)
+	full := "✅ نشست فعال شد: " + name + "\n" + sid + "\n\n" + b.sessionTopicsText(sid)
+	b.sendChunks(chatID, full, 0)
+}
+
+// sessionTopicsText موضوعاتی که تاکنون در نشست مطرح شده‌اند (یک مورد برای هر پیام کاربر)
+func (b *Bot) sessionTopicsText(sid string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	msgs, err := b.oc.ListMessages(ctx, sid, 1000)
+	if err != nil {
+		return "⚠️ فهرست موضوعات در دسترس نبود: " + err.Error()
+	}
+	var topics []string
+	for _, m := range msgs {
+		if m.Info.Role != "user" {
+			continue
+		}
+		t := ""
+		for _, p := range m.Parts {
+			if p.Type == "text" && strings.TrimSpace(p.Text) != "" {
+				t = strings.TrimSpace(p.Text)
+				break
+			}
+		}
+		if i := strings.Index(t, "\n\nفایل پیوست:"); i > 0 {
+			t = t[:i]
+		}
+		t = collapse(t)
+		if t == "" {
+			t = "(پیام بدون متن)"
+		}
+		topics = append(topics, clipHead(t, 140))
+	}
+	if len(topics) == 0 {
+		return "📋 هنوز موضوعی در این نشست مطرح نشده."
+	}
+	const show = 50
+	hidden := 0
+	if len(topics) > show {
+		hidden = len(topics) - show
+		topics = topics[len(topics)-show:]
+	}
+	var sb strings.Builder
+	if hidden > 0 {
+		fmt.Fprintf(&sb, "📋 موضوعات این نشست (آخرین %d از %d مورد):\n", show, hidden+show)
+	} else {
+		fmt.Fprintf(&sb, "📋 موضوعات مطرح‌شده در این نشست (%d مورد):\n", len(topics))
+	}
+	start := hidden + 1
+	for i, t := range topics {
+		fmt.Fprintf(&sb, "%s. %s\n", faNum(start+i), t)
+	}
+	return strings.TrimRight(sb.String(), "\n")
+}
+
 func (b *Bot) openSessions(userID, chatID int64, msgID int) {
 	st := b.stateFor(userID, chatID)
 	b.mu.Lock()
@@ -973,14 +1023,10 @@ func (b *Bot) openSessions(userID, chatID int64, msgID int) {
 			}
 		}
 		if !had {
-			st.Sessions = append([]string{st.SessionID}, st.Sessions...)
+			st.Sessions = append(st.Sessions, st.SessionID)
 		}
 	}
-	for i, sid := range st.Sessions {
-		if st.Labels[sid] == "" {
-			st.Labels[sid] = defaultSessionName(i + 1)
-		}
-	}
+	renumberAutoLabels(st)
 	var ids []string
 	ids = append(ids, st.Sessions...)
 	labels := map[string]string{}
@@ -998,12 +1044,11 @@ func (b *Bot) openSessions(userID, chatID int64, msgID int) {
 	} else {
 		for i, sid := range ids {
 			_, running := b.runFor(sid)
-			num := fmt.Sprintf("%d.", i+1)
 			name := labels[sid]
 			if name == "" {
 				name = defaultSessionName(i + 1)
 			}
-			line := fmt.Sprintf("%s <b>%s</b>  `%s`", num, name, shortSID(sid))
+			line := fmt.Sprintf("<b>%s</b>  `%s`", name, shortSID(sid))
 			if sid == active {
 				line += "  ← فعال"
 			}
@@ -1012,7 +1057,7 @@ func (b *Bot) openSessions(userID, chatID int64, msgID int) {
 			}
 			sb.WriteString(line + "\n")
 		}
-		sb.WriteString("\nنام هر نشست خودکار از روی آخرین موضوعش است؛ با ✏️ دستی تغییرش بده و با 🗑 آن را ببند. جابه‌جایی، اجرای در جریان را قطع نمی‌کند.")
+		sb.WriteString("\nنام پیش‌فرض نشست‌ها شماره است (۱، ۲، ۳…). با ✏️ می‌توانی نام دلخواه بگذاری و با 🗑 نشست را ببندی. جابه‌جایی، اجرای در جریان را قطع نمی‌کند.")
 	}
 
 	var rows [][]tgbotapi.InlineKeyboardButton
@@ -1079,9 +1124,7 @@ func (b *Bot) onSessionsCallback(userID, chatID int64, msgID int, data string) {
 		switch parts[1] {
 		case "use":
 			sid := parts[2]
-			b.setSession(userID, sid)
-			st := b.stateFor(userID, chatID)
-			b.send(chatID, "✅ نشست فعال شد:\n"+b.sessionLabel(st, sid)+"\n"+sid)
+			b.useSession(userID, chatID, sid)
 			b.openSessions(userID, chatID, msgID)
 		case "rn":
 			sid := parts[2]
