@@ -42,9 +42,12 @@ const helpText = `ربات کنترل opencode روی سرور
 
 اگر مدل در میانهٔ کار سؤالی بپرسد (مثل خود CLI)، همان پیام گزینه‌ها را دارد؛ با دکمه‌ها پاسخ بده تا اجرا ادامه یابد. ✏️ یعنی می‌توانی پاسخ خودت را تایپ کنی.`
 
+// botVersion نسخهٔ ربات است؛ هنگام انتشار نسخهٔ جدید آن را به‌روز کن
+const botVersion = "v8.1"
+
 const (
 	btnStatus    = "📊 وضعیت و هزینه"
-	btnSettings  = "⚙️ تنظیمات"
+	btnSettings  = "⚙️ تنظیمات " + botVersion
 	btnSessions  = "🗂 نشست‌ها"
 	maxFileBytes = 30 << 20
 
@@ -90,6 +93,7 @@ type Bot struct {
 	states map[int64]*UserState
 	runs   map[string]*runCtl // کلید = نشست opencode
 	cost   map[int64]costInfo
+	stm    map[string]int64 // زمان ساخت نشست (epoch ms) — برای برچسب خودکار تاریخ‌دار
 
 	qmu  sync.Mutex
 	qmap map[string]*pendingQ // توکن کوتاه → سؤال در انتظار پاسخ
@@ -114,6 +118,7 @@ func newBot(cfg *Config, api *tgbotapi.BotAPI) *Bot {
 		states: map[int64]*UserState{},
 		runs:   map[string]*runCtl{},
 		cost:   map[int64]costInfo{},
+		stm:    map[string]int64{},
 		qmap:   map[string]*pendingQ{},
 		cat:    newModelCatalog(filepath.Join(filepath.Dir(cfg.StateFile), "catalog-models.json")),
 		mlc:    map[int64]modelsCtx{},
@@ -182,8 +187,17 @@ func renumberAutoLabels(st *UserState) {
 	}
 }
 
-// sessionLabel نام نمایشی نشست
+// sessionLabel نام نمایشی نشست؛ نام دستی کاربر همان می‌ماند و نام خودکار
+// به «تاریخ و ساعت ساخت» (شمسی، به وقت ایران) تبدیل می‌شود.
 func (b *Bot) sessionLabel(st *UserState, sid string) string {
+	if st.Manual != nil && st.Manual[sid] {
+		if l := st.Labels[sid]; l != "" {
+			return l
+		}
+	}
+	if ms, ok := b.createdOf(sid); ok {
+		return createdTimeLabel(ms, time.Now())
+	}
 	if st.Labels != nil {
 		if l := st.Labels[sid]; l != "" {
 			return l
@@ -195,6 +209,38 @@ func (b *Bot) sessionLabel(st *UserState, sid string) string {
 		}
 	}
 	return shortSID(sid)
+}
+
+// createdOf زمان ساخت نشست را از کش برمی‌گرداند
+func (b *Bot) createdOf(sid string) (int64, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	t, ok := b.stm[sid]
+	return t, ok
+}
+
+// setCreated زمان ساخت نشست را در کش ثبت می‌کند
+func (b *Bot) setCreated(sid string, ms int64) {
+	if sid == "" || ms <= 0 {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.stm[sid] = ms
+}
+
+// rememberTimes زمان ساخت همهٔ نشست‌های فهرست سرور را در کش ثبت می‌کند
+func (b *Bot) rememberTimes(list []OCSession) {
+	if len(list) == 0 {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, s := range list {
+		if s.Time.Created > 0 {
+			b.stm[s.ID] = s.Time.Created
+		}
+	}
 }
 
 func (b *Bot) saveStates() error {
@@ -731,6 +777,7 @@ func (b *Bot) newSession(userID, chatID int64) {
 		b.send(chatID, "ساخت نشست ممکن نشد: "+err.Error())
 		return
 	}
+	b.setCreated(s.ID, s.Time.Created)
 	b.setSession(userID, s.ID)
 	st := b.stateFor(userID, chatID)
 	b.send(chatID, "نشست جدید ساخته و فعال شد.\n"+b.sessionLabel(st, s.ID)+"\n"+s.ID)
@@ -1134,6 +1181,7 @@ func (b *Bot) sessionsPage(userID, chatID int64, msgID, page int) {
 	cancel()
 	var warn error
 	if err == nil {
+		b.rememberTimes(list)
 		b.syncLiveSessions(st, list)
 	} else {
 		warn = err
@@ -1142,10 +1190,6 @@ func (b *Bot) sessionsPage(userID, chatID int64, msgID, page int) {
 	b.mu.Lock()
 	ids := make([]string, len(st.Sessions))
 	copy(ids, st.Sessions)
-	labels := make(map[string]string, len(st.Labels))
-	for k, v := range st.Labels {
-		labels[k] = v
-	}
 	active := st.SessionID
 	b.mu.Unlock()
 
@@ -1197,10 +1241,7 @@ func (b *Bot) sessionsPage(userID, chatID int64, msgID, page int) {
 	for i := start; i < end; i++ {
 		sid := ids[i]
 		_, running := b.runFor(sid)
-		name := labels[sid]
-		if name == "" {
-			name = defaultSessionName(i + 1)
-		}
+		name := b.sessionLabel(st, sid)
 		line := fmt.Sprintf("<b>%s</b>  `%s`", name, shortSID(sid))
 		if sid == active {
 			line += "  ← فعال"
@@ -1215,10 +1256,7 @@ func (b *Bot) sessionsPage(userID, chatID int64, msgID, page int) {
 	var rows [][]tgbotapi.InlineKeyboardButton
 	for i := start; i < end; i++ {
 		sid := ids[i]
-		label := labels[sid]
-		if label == "" {
-			label = defaultSessionName(i + 1)
-		}
+		label := b.sessionLabel(st, sid)
 		row := []tgbotapi.InlineKeyboardButton{}
 		if sid == active {
 			row = append(row, inlineBtn("✓ "+clipHead(label, 18), "ss:noop"))
