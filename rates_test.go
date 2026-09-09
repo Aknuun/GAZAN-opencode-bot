@@ -6,6 +6,23 @@ import (
 	"time"
 )
 
+func TestWallexToman(t *testing.T) {
+	body := []byte(`{"result":{"symbols":{"USDTTMN":{"symbol":"USDTTMN","stats":{"lastPrice":"232002.0000000000000000"}}}}}`)
+	got, err := wallexToman(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 232002 {
+		t.Fatalf("got %v want 232002", got)
+	}
+}
+
+func TestWallexMissingSymbol(t *testing.T) {
+	if _, err := wallexToman([]byte(`{"result":{"symbols":{}}}`)); err == nil {
+		t.Fatal("expected error when USDTTMN missing")
+	}
+}
+
 func TestNobitexToman(t *testing.T) {
 	// قیمت USDT به ریال مثلاً ۷۰۰٬۰۰۰ ریال → ۷۰٬۰۰۰ تومان
 	body := []byte(`{"status":"ok","stats":{"usdt-rls":{"latest":700000}}}`)

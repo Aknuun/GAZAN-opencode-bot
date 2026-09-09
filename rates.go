@@ -112,13 +112,64 @@ func (f *fxStore) keepWarm() {
 	}
 }
 
-// fetchTomanPerUSD نرخ بازار (نوبیتکس) را می‌گیرد؛ اگر در دسترس نبود از
-// نرخ ارز جهانی (IRR) استفاده می‌کند. خروجی: تومان به ازای هر ۱ دلار.
+// fetchTomanPerUSD نرخ بازارِ تومان را می‌گیرد؛ اول والکس (قیمت تتر-تومان)، بعد
+// نوبیتکس (ریال/۱۰) و در آخر نرخ رسمی ارز (IRR). خروجی: تومان به ازای هر ۱ دلار.
 func fetchTomanPerUSD(ctx context.Context) (float64, error) {
+	if v, err := fetchWallex(ctx); err == nil && v > 0 {
+		return v, nil
+	}
 	if v, err := fetchNobitex(ctx); err == nil && v > 0 {
 		return v, nil
 	}
 	return fetchIRR(ctx)
+}
+
+// fetchWallex قیمت تتر-تومان (USDTTMN) را از والکس می‌گیرد. قیمت بازار است و
+// مستقیم «تومان به ازای هر دلار» برمی‌گرداند.
+func fetchWallex(ctx context.Context) (float64, error) {
+	nctx, cancel := context.WithTimeout(ctx, fxReqTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(nctx, http.MethodGet, "https://api.wallex.ir/v1/markets", nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return 0, fmt.Errorf("wallex: %s", resp.Status)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if err != nil {
+		return 0, err
+	}
+	return wallexToman(body)
+}
+
+func wallexToman(body []byte) (float64, error) {
+	var parsed struct {
+		Result struct {
+			Symbols map[string]struct {
+				Stats struct {
+					LastPrice json.RawMessage `json:"lastPrice"`
+				} `json:"stats"`
+			} `json:"symbols"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return 0, err
+	}
+	s, ok := parsed.Result.Symbols["USDTTMN"]
+	if !ok {
+		return 0, errors.New("wallex: USDTTMN یافت نشد")
+	}
+	last, err := parseJSONNum(s.Stats.LastPrice)
+	if err != nil || last <= 0 {
+		return 0, errors.New("wallex: قیمت نامعتبر")
+	}
+	return last, nil
 }
 
 // fetchNobitex قیمت USDT (≈دلار) را از نوبیتکس به ریال می‌گیرد و به تومان برمی‌گرداند.
