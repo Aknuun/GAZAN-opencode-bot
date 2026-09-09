@@ -2,20 +2,39 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+
+	"opencode-tg-bot/internal/occlient"
 )
+
+// ocAPI اینترفیس API سرور opencode است؛ کانکریت آن occlient.Client است و در
+// تست‌ها می‌توان یک پیاده‌سازی fake به ربات داد.
+type ocAPI interface {
+	CreateSession(context.Context) (*occlient.Session, error)
+	ListSessions(context.Context, int) ([]occlient.Session, error)
+	DeleteSession(context.Context, string) error
+	GetSession(context.Context, string) (*occlient.Session, error)
+	PromptAsync(context.Context, string, string, string) error
+	LastMessage(context.Context, string) (*occlient.Message, error)
+	ListMessages(context.Context, string, int) ([]occlient.Message, error)
+	Abort(context.Context, string) error
+	ListQuestions(context.Context) ([]occlient.QuestionRequest, error)
+	ReplyQuestion(context.Context, string, [][]string) error
+	RejectQuestion(context.Context, string) error
+}
+
+// اطمینان از اینکه کلاینت واقعی اینترفیس را پیاده می‌کند
+var _ ocAPI = (*occlient.Client)(nil)
 
 const helpText = `ربات کنترل opencode روی سرور
 
@@ -64,17 +83,6 @@ const (
 	sessionsPageSize   = 10  // هر صفحه از مدیر نشست‌ها چند نشست نشان دهد
 )
 
-type UserState struct {
-	UserID    int64             `json:"user_id"`
-	ChatID    int64             `json:"chat_id"`
-	SessionID string            `json:"session_id,omitempty"`
-	Sessions  []string          `json:"sessions,omitempty"`
-	Labels    map[string]string `json:"labels,omitempty"` // نام نمایشی نشست‌ها
-	Manual    map[string]bool   `json:"manual,omitempty"` // نشست‌هایی که کاربر با ✏️ دستی نامشان را عوض کرده
-	Agent     string            `json:"agent,omitempty"`
-	Pending   string            `json:"pending,omitempty"`
-}
-
 // runCtl کنترل اجرای هم‌زمان یک نشست
 type runCtl struct {
 	SID     string
@@ -86,84 +94,41 @@ type runCtl struct {
 }
 
 type Bot struct {
-	cfg    *Config
-	oc     *OCClient
-	api    *tgbotapi.BotAPI
-	mu     sync.Mutex
-	states map[int64]*UserState
-	runs   map[string]*runCtl // کلید = نشست opencode
-	cost   map[int64]costInfo
-	act    map[string]int64 // زمان آخرین فعالیت نشست (epoch ms) — برای برچسب خودکار تاریخ‌دار
+	cfg   *Config
+	oc    ocAPI
+	api   telegramAPI
+	users *userStore // state ماندگار کاربران + ذخیره‌سازی اتمیک
+	ui    *uiState   // داده‌های گذرای رابط کاربری (صفحه‌ها/حالت گروهی/کش هزینه)
+	runs  *runManager
+	qs    *qReg // سؤال‌های تعاملی در انتظار پاسخ
 
-	qmu  sync.Mutex
-	qmap map[string]*pendingQ // توکن کوتاه → سؤال در انتظار پاسخ
-	qseq int64
-
-	cat *modelCatalog             // کاتالوگ مدل‌ها (models.dev) با کش
-	mlc map[int64]modelsCtx       // صفحهٔ مدل‌های بازشده برای هر چت
-	scx map[int64]searchCtx       // نتایج جست‌وجوی باز برای هر چت
-	ssp map[int64]int             // آخرین صفحهٔ باز «🗂 نشست‌ها» برای هر چت
-	gsm map[int64]bool            // حالت انتخاب گروهی برای هر چت فعال است؟
-	gsl map[int64]map[string]bool // sid های انتخاب‌شده در حالت گروهی برای هر چت
+	cat *modelCatalog // کاتالوگ مدل‌ها (models.dev) با کش
 }
 
-type costInfo struct {
-	when  time.Time
-	label string
-}
-
-func newBot(cfg *Config, api *tgbotapi.BotAPI) *Bot {
+func newBot(cfg *Config, api telegramAPI) *Bot {
 	return &Bot{
-		cfg:    cfg,
-		oc:     newOCClient(cfg.BaseURL, cfg.Agent),
-		api:    api,
-		states: map[int64]*UserState{},
-		runs:   map[string]*runCtl{},
-		cost:   map[int64]costInfo{},
-		act:    map[string]int64{},
-		qmap:   map[string]*pendingQ{},
-		cat:    newModelCatalog(filepath.Join(filepath.Dir(cfg.StateFile), "catalog-models.json")),
-		mlc:    map[int64]modelsCtx{},
-		scx:    map[int64]searchCtx{},
-		ssp:    map[int64]int{},
-		gsm:    map[int64]bool{},
-		gsl:    map[int64]map[string]bool{},
+		cfg:   cfg,
+		oc:    occlient.New(cfg.BaseURL, cfg.Agent),
+		api:   api,
+		users: newUserStore(cfg.StateFile),
+		ui:    newUIState(),
+		runs:  newRunManager(),
+		qs:    newQReg(),
+		cat:   newModelCatalog(filepath.Join(filepath.Dir(cfg.StateFile), "catalog-models.json")),
 	}
+}
+
+// close ذخیرهٔ نهایی state و توقف ذخیره‌کننده را انجام می‌دهد (قبل از خروج).
+func (b *Bot) close() error {
+	return b.users.Close()
 }
 
 func (b *Bot) loadStates() error {
-	data, err := os.ReadFile(b.cfg.StateFile)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return err
-	}
-	if err := json.Unmarshal(data, &b.states); err != nil {
-		return err
-	}
-	b.normalizeStates()
-	return nil
+	return b.users.load()
 }
 
-// normalizeStates نام پیش‌فرض نشست‌ها را شماره می‌کند (۱، ۲، ۳…)
-func (b *Bot) normalizeStates() {
-	for _, st := range b.states {
-		if st.Labels == nil {
-			st.Labels = map[string]string{}
-		}
-		// مطمئن شو نشست فعال در لیست هست
-		if st.SessionID != "" {
-			st.Sessions = addSessionID(st.Sessions, st.SessionID)
-		}
-		renumberAutoLabels(st)
-	}
-	b.saveStates()
-}
-
-// defaultSessionName نام پیش‌فرض نشست: فقط شماره (۱، ۲، ۳…)
-func defaultSessionName(n int) string {
-	return faNum(n)
+func (b *Bot) allowed(userID int64) bool {
+	return b.cfg.Allowed[userID]
 }
 
 // faNum اعداد را به رقم فارسی تبدیل می‌کند
@@ -177,206 +142,35 @@ func faNum(n int) string {
 	return string(r)
 }
 
-// renumberAutoLabels نشست‌های بدون نام دستی را بر اساس جایگاهشان شماره‌گذاری می‌کند
-// (نام‌هایی که کاربر با ✏️ گذاشته دست‌نخورده می‌مانند)
-func renumberAutoLabels(st *UserState) {
-	if st.Labels == nil {
-		st.Labels = map[string]string{}
-	}
-	for i, sid := range st.Sessions {
-		if st.Manual != nil && st.Manual[sid] {
-			continue
-		}
-		st.Labels[sid] = defaultSessionName(i + 1)
-	}
-}
-
-// sessionLabel نام نمایشی نشست؛ نام دستی کاربر همان می‌ماند و نام خودکار
-// به «تاریخ و ساعت آخرین فعالیت» (شمسی، به وقت ایران) تبدیل می‌شود.
-func (b *Bot) sessionLabel(st *UserState, sid string) string {
-	if st.Manual != nil && st.Manual[sid] {
-		if l := st.Labels[sid]; l != "" {
-			return l
-		}
-	}
-	if ms, ok := b.lastActivityOf(sid); ok {
-		return persianTimeLabel(ms, time.Now())
-	}
-	if st.Labels != nil {
-		if l := st.Labels[sid]; l != "" {
-			return l
-		}
-	}
-	for i, s := range st.Sessions {
-		if s == sid {
-			return defaultSessionName(i + 1)
-		}
-	}
-	return shortSID(sid)
-}
-
-// lastActivityOf زمان آخرین فعالیت نشست را از کش برمی‌گرداند
-func (b *Bot) lastActivityOf(sid string) (int64, bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	t, ok := b.act[sid]
-	return t, ok
-}
-
-// setLastActivity زمان آخرین فعالیت نشست را در کش ثبت می‌کند
-func (b *Bot) setLastActivity(sid string, ms int64) {
-	if sid == "" || ms <= 0 {
-		return
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.act[sid] = ms
-}
-
-// lastActivityOfOC آخرین فعالیت یک نشست سرور را می‌دهد؛ اگر سرور آن را ندهد به زمان ساخت برمی‌گردد
-func lastActivityOfOC(s *OCSession) int64 {
-	if s.Time.Updated > 0 {
-		return s.Time.Updated
-	}
-	return s.Time.Created
-}
-
-// rememberActivity زمان آخرین فعالیت همهٔ نشست‌های فهرست سرور را در کش ثبت می‌کند
-func (b *Bot) rememberActivity(list []OCSession) {
-	if len(list) == 0 {
-		return
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	for _, s := range list {
-		if ms := lastActivityOfOC(&s); ms > 0 {
-			b.act[s.ID] = ms
-		}
-	}
-}
-
-func (b *Bot) saveStates() error {
-	data, err := json.Marshal(b.states)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(b.cfg.StateFile, data, 0o600)
-}
-
-func (b *Bot) allowed(userID int64) bool {
-	return b.cfg.Allowed[userID]
+// sessionLabel نام نمایشی نشست را برمی‌گرداند (نام دستی یا تاریخ آخرین فعالیت).
+func (b *Bot) sessionLabel(userID int64, sid string) string {
+	return b.users.sessionLabel(userID, sid)
 }
 
 func (b *Bot) stateFor(userID, chatID int64) *UserState {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	st, ok := b.states[userID]
-	if !ok {
-		st = &UserState{UserID: userID, ChatID: chatID}
-		b.states[userID] = st
-		b.saveStates()
-	}
-	st.ChatID = chatID
-	return st
+	return b.users.ensure(userID, chatID)
 }
 
 func (b *Bot) stateOf(userID int64) *UserState {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.states[userID]
+	return b.users.byID(userID)
 }
 
 func (b *Bot) setSession(userID int64, id string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	st := b.states[userID]
-	if st == nil {
-		return
-	}
-	had := false
-	for _, s := range st.Sessions {
-		if s == id {
-			had = true
-			break
-		}
-	}
-	if !had {
-		st.Sessions = append(st.Sessions, id)
-	}
-	st.SessionID = id
-	if st.Labels == nil {
-		st.Labels = map[string]string{}
-	}
-	if st.Labels[id] == "" {
-		st.Labels[id] = defaultSessionName(len(st.Sessions))
-	}
-	b.saveStates()
+	b.users.activate(userID, id)
 }
 
-func addSessionID(list []string, id string) []string {
-	for _, s := range list {
-		if s == id {
-			return list
-		}
-	}
-	return append(list, id)
-}
-
-// setSessionLabel نام دستی (با ✏️) نشست را به‌روز می‌کند
 func (b *Bot) setSessionLabel(userID int64, sid, label string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	st := b.states[userID]
-	if st == nil {
-		return
-	}
-	if st.Labels == nil {
-		st.Labels = map[string]string{}
-	}
-	if st.Manual == nil {
-		st.Manual = map[string]bool{}
-	}
-	st.Labels[sid] = label
-	st.Manual[sid] = true
-	b.saveStates()
+	b.users.rename(userID, sid, label)
 }
 
 // deleteSession حذف نشست از فهرست کاربر (+ توقف اجرا اگر در جریان باشد)
 func (b *Bot) deleteSession(userID int64, sid string) {
 	b.stopRun(sid)
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	st := b.states[userID]
-	if st == nil {
-		return
-	}
-	var keep []string
-	for _, s := range st.Sessions {
-		if s != sid {
-			keep = append(keep, s)
-		}
-	}
-	st.Sessions = keep
-	if st.Labels != nil {
-		delete(st.Labels, sid)
-	}
-	if st.Manual != nil {
-		delete(st.Manual, sid)
-	}
-	if st.SessionID == sid {
-		st.SessionID = ""
-	}
-	renumberAutoLabels(st)
-	b.saveStates()
+	b.users.remove(userID, sid)
 }
 
 func (b *Bot) setAgentValue(userID int64, agent string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if st := b.states[userID]; st != nil {
-		st.Agent = agent
-		b.saveStates()
-	}
+	b.users.setAgent(userID, agent)
 }
 
 func (b *Bot) ensureSession(userID, chatID int64) (string, error) {
@@ -399,8 +193,8 @@ func (b *Bot) ensureSession(userID, chatID int64) (string, error) {
 }
 
 func (b *Bot) agentFor(userID int64) string {
-	if st := b.stateOf(userID); st != nil && st.Agent != "" {
-		return st.Agent
+	if a := b.users.agentOf(userID); a != "" {
+		return a
 	}
 	if b.cfg != nil {
 		return b.cfg.Agent
@@ -409,31 +203,21 @@ func (b *Bot) agentFor(userID int64) string {
 }
 
 func (b *Bot) userForChat(chatID int64) int64 {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	for uid, st := range b.states {
-		if st.ChatID == chatID {
-			return uid
-		}
-	}
-	return 0
+	return b.users.userForChat(chatID)
 }
 
 func (b *Bot) costLabel(userID int64) string {
-	st := b.stateOf(userID)
-	if st == nil || st.SessionID == "" {
+	sid := b.users.activeSession(userID)
+	if sid == "" {
 		return btnStatus
 	}
-	b.mu.Lock()
-	if c, ok := b.cost[userID]; ok && time.Since(c.when) < 4*time.Second {
-		b.mu.Unlock()
-		return c.label
+	if label, ok := b.ui.costCached(userID); ok {
+		return label
 	}
-	b.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
-	s, err := b.oc.GetSession(ctx, st.SessionID)
+	s, err := b.oc.GetSession(ctx, sid)
 	label := btnStatus
 	if err == nil {
 		total := s.Tokens.Input + s.Tokens.Output
@@ -443,9 +227,7 @@ func (b *Bot) costLabel(userID int64) string {
 			label = fmt.Sprintf("📊 $%.4f · %s توکن", s.Cost, abbrev(total))
 		}
 	}
-	b.mu.Lock()
-	b.cost[userID] = costInfo{when: time.Now(), label: label}
-	b.mu.Unlock()
+	b.ui.storeCost(userID, label)
 	return label
 }
 
@@ -555,37 +337,25 @@ func (b *Bot) sendChunks(chatID int64, text string, progressMsgID int) {
 // ---------- مدیریت اجراها ----------
 
 func (b *Bot) runFor(sid string) (*runCtl, bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	r, ok := b.runs[sid]
-	return r, ok
+	return b.runs.get(sid)
+}
+
+// isRunning می‌گوید آیا نشستی همین حالا در حال اجراست یا نه.
+func (b *Bot) isRunning(sid string) bool {
+	_, ok := b.runs.get(sid)
+	return ok
 }
 
 func (b *Bot) activeRunsOf(userID int64) int {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	n := 0
-	for _, r := range b.runs {
-		if r.UserID == userID {
-			n++
-		}
-	}
-	return n
+	return b.runs.countFor(userID)
 }
 
 func (b *Bot) addRun(r *runCtl) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.runs[r.SID] = r
+	b.runs.add(r)
 }
 
 func (b *Bot) delRun(sid string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if r, ok := b.runs[sid]; ok {
-		close(r.done)
-		delete(b.runs, sid)
-	}
+	b.runs.remove(sid)
 }
 
 func (b *Bot) stopRun(sid string) bool {
@@ -641,13 +411,13 @@ func (b *Bot) Handle(upd tgbotapi.Update) {
 		b.openSessions(userID, chatID, 0)
 		return
 	}
-	if st := b.stateFor(userID, chatID); st.Pending != "" {
+	if uid, pending := b.users.pendingForChat(chatID); pending != "" {
 		if strings.HasPrefix(text, "/") {
-			b.clearPending(st)
+			b.users.clearPending(uid)
 			b.handleCommand(upd, text)
 			return
 		}
-		b.handlePending(userID, chatID, st.Pending, text)
+		b.handlePending(uid, chatID, pending, text)
 		return
 	}
 	if strings.HasPrefix(text, "/") {
@@ -657,25 +427,49 @@ func (b *Bot) Handle(upd tgbotapi.Update) {
 	b.submitPrompt(userID, chatID, text)
 }
 
+// cbRoute یک مسیر callback تلگرام است: پیشوند + تابع اجراکننده.
+type cbRoute struct {
+	prefix string
+	run    func(b *Bot, cq *tgbotapi.CallbackQuery)
+}
+
+// cbRoutes روتر یکپارچهٔ callbackها: هر بخش از ربات پیشوند خودش را ثبت کرده و
+// بدون وابستگی به بخش‌های دیگر فقط با `data` مسیر را پیدا می‌کند.
+var cbRoutes = []cbRoute{
+	{prefix: "s:", run: settingsAction},
+	{prefix: "ss:", run: sessionsAction},
+	{prefix: "qa:", run: questionAction},
+	{prefix: "stop:", run: stopRunAction},
+}
+
+func settingsAction(b *Bot, cq *tgbotapi.CallbackQuery) {
+	b.onSettingsCallback(cq.From.ID, cq.Message.Chat.ID, cq.Message.MessageID, cq.Data)
+}
+
+func sessionsAction(b *Bot, cq *tgbotapi.CallbackQuery) {
+	b.onSessionsCallback(cq.From.ID, cq.Message.Chat.ID, cq.Message.MessageID, cq.Data)
+}
+
+func questionAction(b *Bot, cq *tgbotapi.CallbackQuery) {
+	b.onQCallback(cq.Message.Chat.ID, cq.Data)
+}
+
+func stopRunAction(b *Bot, cq *tgbotapi.CallbackQuery) {
+	b.stopRun(strings.TrimPrefix(cq.Data, "stop:"))
+}
+
 func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
-	userID := cq.From.ID
-	chatID := cq.Message.Chat.ID
-	if !b.allowed(userID) {
+	if !b.allowed(cq.From.ID) {
 		return
 	}
 	b.api.Request(tgbotapi.NewCallback(cq.ID, ""))
-	data := cq.Data
-	switch {
-	case strings.HasPrefix(data, "s:"):
-		b.onSettingsCallback(userID, chatID, cq.Message.MessageID, data)
-	case strings.HasPrefix(data, "ss:"):
-		b.onSessionsCallback(userID, chatID, cq.Message.MessageID, data)
-	case strings.HasPrefix(data, "qa:"):
-		b.onQCallback(chatID, data)
-	case strings.HasPrefix(data, "stop:"):
-		sid := strings.TrimPrefix(data, "stop:")
-		b.stopRun(sid)
+	for _, r := range cbRoutes {
+		if strings.HasPrefix(cq.Data, r.prefix) {
+			r.run(b, cq)
+			return
+		}
 	}
+	slog.Warn("callback ناشناخته", "data", cq.Data, "user", cq.From.ID)
 }
 
 // ---------- فایل ----------
@@ -789,10 +583,9 @@ func (b *Bot) newSession(userID, chatID int64) {
 		b.send(chatID, "ساخت نشست ممکن نشد: "+err.Error())
 		return
 	}
-	b.setLastActivity(s.ID, lastActivityOfOC(s))
+	b.users.setActivity(s.ID, lastActivityOfOC(s))
 	b.setSession(userID, s.ID)
-	st := b.stateFor(userID, chatID)
-	b.send(chatID, "نشست جدید ساخته و فعال شد.\n"+b.sessionLabel(st, s.ID)+"\n"+s.ID)
+	b.send(chatID, "نشست جدید ساخته و فعال شد.\n"+b.sessionLabel(userID, s.ID)+"\n"+s.ID)
 }
 
 func (b *Bot) listSessions(chatID int64) {
@@ -845,13 +638,7 @@ func (b *Bot) showStatus(userID, chatID int64) {
 // abortAllRuns همهٔ اجرای‌های فعال را متوقف می‌کند (بعد از تغییر مدل)
 // بعد از ری‌استارت سرور، تمام اجرای‌های قبلی بی‌اعتبار می‌شوند
 func (b *Bot) abortAllRuns() {
-	b.mu.Lock()
-	for id, r := range b.runs {
-		r.cancel()
-		close(r.done)
-		delete(b.runs, id)
-	}
-	b.mu.Unlock()
+	b.runs.abortAll()
 }
 
 // ---------- ارسال پرامپت و اجرا ----------
@@ -867,18 +654,17 @@ func (b *Bot) submitPrompt(userID, chatID int64, prompt string) {
 		return
 	}
 	st := b.stateFor(userID, chatID)
-	if st.SessionID == "" {
-		sid, err := b.ensureSession(userID, chatID)
+	sid := st.SessionID
+	if sid == "" {
+		created, err := b.ensureSession(userID, chatID)
 		if err != nil {
 			b.send(chatID, err.Error())
 			return
 		}
-		st = b.stateFor(userID, chatID)
-		st.SessionID = sid
+		sid = created
 	}
-	sid := st.SessionID
 	if _, busy := b.runFor(sid); busy {
-		if b.qForChat(chatID) != nil {
+		if b.qs.forChat(chatID) != nil {
 			b.send(chatID, "مدل سؤالی پرسیده؛ با دکمه‌های همان پیام پاسخ بده (یا ✏️ بنویس).")
 			return
 		}
@@ -1012,8 +798,7 @@ func (b *Bot) sessionLine(st *UserState, sid string) string {
 // useSession نشست را فعال می‌کند و فهرست موضوعات مطرح‌شده در آن را نشان می‌دهد
 func (b *Bot) useSession(userID, chatID int64, sid string) {
 	b.setSession(userID, sid)
-	st := b.stateFor(userID, chatID)
-	name := b.sessionLabel(st, sid)
+	name := b.sessionLabel(userID, sid)
 	full := "✅ نشست فعال شد: " + name + "\n" + sid + "\n\n" + b.sessionTopicsText(sid)
 	b.sendChunks(chatID, full, 0)
 }
@@ -1075,88 +860,39 @@ func (b *Bot) openSessions(userID, chatID int64, msgID int) {
 
 // lastSSPage آخرین صفحه‌ای که کاربر در مدیر نشست‌ها دیده را برمی‌گرداند
 func (b *Bot) lastSSPage(chatID int64) int {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.ssp == nil {
-		return 0
-	}
-	return b.ssp[chatID]
+	return b.ui.ssPage(chatID)
 }
 
 func (b *Bot) setSSPage(chatID int64, page int) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.ssp == nil {
-		b.ssp = map[int64]int{}
-	}
-	b.ssp[chatID] = page
+	b.ui.setSSPage(chatID, page)
 }
 
 func (b *Bot) setGroupMode(chatID int64, on bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.gsm == nil {
-		b.gsm = map[int64]bool{}
-	}
-	b.gsm[chatID] = on
+	b.ui.setGroupMode(chatID, on)
 }
 
 func (b *Bot) groupMode(chatID int64) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.gsm == nil {
-		return false
-	}
-	return b.gsm[chatID]
+	return b.ui.groupMode(chatID)
 }
 
 func (b *Bot) groupSel(chatID int64, sid string) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.gsl == nil {
-		return false
-	}
-	return b.gsl[chatID][sid]
+	return b.ui.groupSel(chatID, sid)
 }
 
 func (b *Bot) toggleGroupSel(chatID int64, sid string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.gsl == nil {
-		b.gsl = map[int64]map[string]bool{}
-	}
-	if b.gsl[chatID] == nil {
-		b.gsl[chatID] = map[string]bool{}
-	}
-	if b.gsl[chatID][sid] {
-		delete(b.gsl[chatID], sid)
-	} else {
-		b.gsl[chatID][sid] = true
-	}
+	b.ui.toggleGroupSel(chatID, sid)
 }
 
 func (b *Bot) clearGroupSel(chatID int64) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.gsl != nil {
-		delete(b.gsl, chatID)
-	}
+	b.ui.clearGroupSel(chatID)
 }
 
 func (b *Bot) groupSelCount(chatID int64) int {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return len(b.gsl[chatID])
+	return b.ui.groupSelCount(chatID)
 }
 
 func (b *Bot) groupSelList(chatID int64) []string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	var out []string
-	for sid := range b.gsl[chatID] {
-		out = append(out, sid)
-	}
-	return out
+	return b.ui.groupSelList(chatID)
 }
 
 // sessionsAtSamePage مدیر نشست‌ها را در همان صفحهٔ قبلی دوباره باز می‌کند
@@ -1164,113 +900,22 @@ func (b *Bot) sessionsAtSamePage(userID, chatID int64, msgID int) {
 	b.sessionsPage(userID, chatID, msgID, b.lastSSPage(chatID))
 }
 
-// syncLiveSessions فهرست نشست‌های ربات را با sessionهای واقعی سرور همگام می‌کند:
-// نشست‌های تازهٔ سرور (مثل نشست‌های ساخته‌شده از CLI) اضافه و نشست‌های حذف‌شده حذف می‌شوند.
-// شماره‌گذاری و نام‌های دستی کاربر دست‌نخورده می‌مانند.
-func (b *Bot) syncLiveSessions(st *UserState, list []OCSession) {
-	onSrv := make(map[string]bool, len(list))
-	order := make([]string, 0, len(list))
-	for _, s := range list {
-		onSrv[s.ID] = true
-		order = append(order, s.ID) // سرور به‌ترتیب «آخرین فعالیت» برمی‌گرداند
-	}
-
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	if st.Labels == nil {
-		st.Labels = map[string]string{}
-	}
-	if st.Manual == nil {
-		st.Manual = map[string]bool{}
-	}
-
-	// نشست فعال اگر روی سرور حذف شده باشد دیگر معتبر نیست
-	if st.SessionID != "" && !onSrv[st.SessionID] {
-		st.SessionID = ""
-	}
-
-	// نشست‌هایی که دیگر روی سرور نیستند از فهرست حذف شوند
-	keep := st.Sessions[:0]
-	for _, sid := range st.Sessions {
-		if onSrv[sid] {
-			keep = append(keep, sid)
-		}
-	}
-	st.Sessions = keep
-
-	// نشست‌های تازهٔ سرور به انتهای فهرست افزوده شوند (تا شماره‌ها ثابت بمانند)
-	have := make(map[string]bool, len(st.Sessions))
-	for _, sid := range st.Sessions {
-		have[sid] = true
-	}
-	for _, sid := range order {
-		if have[sid] {
-			continue
-		}
-		st.Sessions = append(st.Sessions, sid)
-		have[sid] = true
-	}
-
-	// برش به حداکثر مجاز؛ نشست فعال/درحال‌اجرا/نام‌گذاری‌شده هرگز حذف نمی‌شود
-	if len(st.Sessions) > maxTrackedSessions {
-		cut := st.Sessions[:0]
-		running := make(map[string]bool, len(b.runs))
-		for id := range b.runs {
-			running[id] = true
-		}
-		over := len(st.Sessions) - maxTrackedSessions
-		for _, sid := range st.Sessions {
-			if over > 0 && sid != st.SessionID && !running[sid] && !st.Manual[sid] {
-				over--
-				continue
-			}
-			cut = append(cut, sid)
-		}
-		st.Sessions = cut
-	}
-
-	// پاکسازی برچسب نشست‌هایی که دیگر در فهرست نیستند
-	st.Sessions = addSessionID(st.Sessions, st.SessionID)
-	kept := make(map[string]bool, len(st.Sessions))
-	for _, sid := range st.Sessions {
-		kept[sid] = true
-	}
-	for sid := range st.Labels {
-		if !kept[sid] {
-			delete(st.Labels, sid)
-		}
-	}
-	for sid := range st.Manual {
-		if !kept[sid] {
-			delete(st.Manual, sid)
-		}
-	}
-
-	renumberAutoLabels(st)
-	b.saveStates()
-}
-
 // sessionsPage یک صفحه از مدیر نشست‌ها را نشان می‌دهد؛ ابتدا از سرور همگام می‌شود
 func (b *Bot) sessionsPage(userID, chatID int64, msgID, page int) {
-	st := b.stateFor(userID, chatID)
+	b.users.ensure(userID, chatID)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	list, err := b.oc.ListSessions(ctx, sessionsFetchMax)
 	cancel()
 	var warn error
 	if err == nil {
-		b.rememberActivity(list)
-		b.syncLiveSessions(st, list)
+		b.users.rememberActivity(list)
+		b.users.syncLive(userID, list, b.isRunning)
 	} else {
 		warn = err
 	}
 
-	b.mu.Lock()
-	ids := make([]string, len(st.Sessions))
-	copy(ids, st.Sessions)
-	active := st.SessionID
-	b.mu.Unlock()
+	ids, active := b.users.snapshotSessions(userID)
 
 	if len(ids) == 0 {
 		text := "🗂 <b>نشست‌ها</b>\n\n"
@@ -1328,7 +973,7 @@ func (b *Bot) sessionsPage(userID, chatID int64, msgID, page int) {
 	for i := start; i < end; i++ {
 		sid := ids[i]
 		_, running := b.runFor(sid)
-		name := b.sessionLabel(st, sid)
+		name := b.sessionLabel(userID, sid)
 		line := fmt.Sprintf("<b>%s</b>  `%s`", name, shortSID(sid))
 		if group && b.groupSel(chatID, sid) {
 			line = "☑️ " + line
@@ -1350,7 +995,7 @@ func (b *Bot) sessionsPage(userID, chatID int64, msgID, page int) {
 	var rows [][]tgbotapi.InlineKeyboardButton
 	for i := start; i < end; i++ {
 		sid := ids[i]
-		label := b.sessionLabel(st, sid)
+		label := b.sessionLabel(userID, sid)
 		if group {
 			mark := "☑️"
 			if b.groupSel(chatID, sid) {
@@ -1434,8 +1079,7 @@ func (b *Bot) onSessionsCallback(userID, chatID int64, msgID int, data string) {
 			return
 		}
 		b.setSession(userID, s.ID)
-		st := b.stateFor(userID, chatID)
-		b.send(chatID, "✅ نشست جدید ساخته و فعال شد:\n"+b.sessionLabel(st, s.ID)+"\n"+s.ID)
+		b.send(chatID, "✅ نشست جدید ساخته و فعال شد:\n"+b.sessionLabel(userID, s.ID)+"\n"+s.ID)
 		b.sessionsAtSamePage(userID, chatID, msgID)
 	case "ss:gm":
 		b.setGroupMode(chatID, true)
@@ -1468,8 +1112,7 @@ func (b *Bot) onSessionsCallback(userID, chatID int64, msgID int, data string) {
 			b.api.Send(edit)
 		case "del":
 			sid := parts[2]
-			st := b.stateFor(userID, chatID)
-			edit := tgbotapi.NewEditMessageText(chatID, msgID, "🗑 نشست «"+b.sessionLabel(st, sid)+"» برای همیشه حذف شود؟\nاین نشست و تمام گفتگویش از روی سرور opencode پاک می‌شود (غیرقابل بازگشت). اجرای در جریان هم متوقف می‌شود.")
+			edit := tgbotapi.NewEditMessageText(chatID, msgID, "🗑 نشست «"+b.sessionLabel(userID, sid)+"» برای همیشه حذف شود؟\nاین نشست و تمام گفتگویش از روی سرور opencode پاک می‌شود (غیرقابل بازگشت). اجرای در جریان هم متوقف می‌شود.")
 			edit.ReplyMarkup = rowsOf(
 				[]tgbotapi.InlineKeyboardButton{inlineBtn("🗑 بله، حذف کن", "ss:delc:"+sid)},
 				[]tgbotapi.InlineKeyboardButton{inlineBtn("انصراف", "ss:refresh")},
@@ -1512,14 +1155,13 @@ func (b *Bot) openGroupDeleteConfirm(userID, chatID int64, msgID int) {
 		b.api.Send(edit)
 		return
 	}
-	st := b.stateFor(userID, chatID)
 	var names []string
 	for i, sid := range sids {
 		if i >= 8 {
 			names = append(names, "…")
 			break
 		}
-		names = append(names, "• "+b.sessionLabel(st, sid))
+		names = append(names, "• "+b.sessionLabel(userID, sid))
 	}
 	text := fmt.Sprintf("🗑 <b>%s نشست</b> برای همیشه حذف شوند؟\nاین نشست‌ها و تمام گفتگویشان از روی سرور opencode پاک می‌شود (غیرقابل بازگشت). اجرای در جریان هم متوقف می‌شود.\n\n%s", faNum(len(sids)), strings.Join(names, "\n"))
 	edit := tgbotapi.NewEditMessageText(chatID, msgID, text)
@@ -1578,7 +1220,7 @@ func isFinalFinish(finish string) bool {
 	return true
 }
 
-func hasPendingQuestion(msg *OCMessage) bool {
+func hasPendingQuestion(msg *occlient.Message) bool {
 	for _, p := range msg.Parts {
 		if p.Type != "tool" || p.Tool != "question" || p.State == nil {
 			continue
@@ -1591,7 +1233,7 @@ func hasPendingQuestion(msg *OCMessage) bool {
 	return false
 }
 
-func joinText(msg *OCMessage) string {
+func joinText(msg *occlient.Message) string {
 	var sb strings.Builder
 	for _, p := range msg.Parts {
 		if p.Type == "text" && strings.TrimSpace(p.Text) != "" {
@@ -1614,7 +1256,7 @@ func preview(text string) string {
 	return text + "\n… (در حال تولید)"
 }
 
-func activityLabel(msg *OCMessage) string {
+func activityLabel(msg *occlient.Message) string {
 	reasoning := ""
 	lastTool := ""
 	for i := len(msg.Parts) - 1; i >= 0; i-- {
@@ -1640,7 +1282,7 @@ func activityLabel(msg *OCMessage) string {
 	return strings.Join(lines, "\n")
 }
 
-func toolLabel(p OCPart) string {
+func toolLabel(p occlient.Part) string {
 	name := p.Tool
 	if name == "" {
 		return ""

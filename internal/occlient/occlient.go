@@ -1,4 +1,6 @@
-package main
+// Package occlient یک کلاینت سبک HTTP برای REST API سرور opencode است.
+// نوع‌های داده‌ای این بسته دقیقاً ساختار JSON خود opencode هستند.
+package occlient
 
 import (
 	"bytes"
@@ -13,23 +15,8 @@ import (
 	"time"
 )
 
-type OCClient struct {
-	base   string
-	agent  string
-	client *http.Client
-}
-
-func newOCClient(base, agent string) *OCClient {
-	return &OCClient{
-		base:  strings.TrimRight(base, "/"),
-		agent: agent,
-		client: &http.Client{
-			Timeout: 30 * time.Second,
-		},
-	}
-}
-
-type OCSession struct {
+// Session یک نشست (گفتگو) روی سرور opencode است.
+type Session struct {
 	ID        string  `json:"id"`
 	Slug      string  `json:"slug"`
 	Title     string  `json:"title"`
@@ -49,20 +36,23 @@ type OCSession struct {
 	} `json:"time"`
 }
 
-type OCPart struct {
-	Type  string       `json:"type"`
-	Text  string       `json:"text"`
-	Tool  string       `json:"tool"`
-	State *OCPartState `json:"state"`
+// Part یک بخش از پیام است: متن، reasoning یا ابزار.
+type Part struct {
+	Type  string     `json:"type"`
+	Text  string     `json:"text"`
+	Tool  string     `json:"tool"`
+	State *PartState `json:"state"`
 }
 
-type OCPartState struct {
+// PartState وضعیت اجرای یک ابزار است.
+type PartState struct {
 	Status string         `json:"status"`
 	Title  string         `json:"title"`
 	Input  map[string]any `json:"input"`
 }
 
-type OCMessage struct {
+// Message یک پیام کامل (اطلاعات + بخش‌ها) در نشست است.
+type Message struct {
 	Info struct {
 		ID        string `json:"id"`
 		Role      string `json:"role"`
@@ -70,10 +60,53 @@ type OCMessage struct {
 		ModelID   string `json:"modelID"`
 		Finish    string `json:"finish"`
 	} `json:"info"`
-	Parts []OCPart `json:"parts"`
+	Parts []Part `json:"parts"`
 }
 
-func (c *OCClient) doJSON(ctx context.Context, method, path string, body any, out any) error {
+// QuestionOption یک گزینهٔ قابل انتخاب در سؤال تعاملی است.
+type QuestionOption struct {
+	Label       string `json:"label"`
+	Description string `json:"description"`
+}
+
+// QuestionInfo یک سؤالِ مطرح‌شده توسط مدل است (مثل سؤال CLI خود opencode).
+type QuestionInfo struct {
+	Question string           `json:"question"`
+	Header   string           `json:"header"`
+	Options  []QuestionOption `json:"options"`
+	Multiple bool             `json:"multiple,omitempty"`
+	Custom   *bool            `json:"custom,omitempty"` // nil یعنی true (پاسخ آزاد مجاز)
+}
+
+// QuestionRequest درخواست سؤالِ در انتظار پاسخ برای یک نشست است.
+type QuestionRequest struct {
+	ID        string         `json:"id"`
+	SessionID string         `json:"sessionID"`
+	Questions []QuestionInfo `json:"questions"`
+	Tool      *struct {
+		MessageID string `json:"messageID"`
+		CallID    string `json:"callID"`
+	} `json:"tool,omitempty"`
+}
+
+// Client یک کلاینت HTTP برای سرور opencode است.
+type Client struct {
+	base   string
+	agent  string
+	client *http.Client
+}
+
+func New(base, agent string) *Client {
+	return &Client{
+		base:  strings.TrimRight(base, "/"),
+		agent: agent,
+		client: &http.Client{
+			Timeout: 30 * time.Second,
+		},
+	}
+}
+
+func (c *Client) doJSON(ctx context.Context, method, path string, body any, out any) error {
 	var rd io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -103,8 +136,8 @@ func (c *OCClient) doJSON(ctx context.Context, method, path string, body any, ou
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
-func (c *OCClient) CreateSession(ctx context.Context) (*OCSession, error) {
-	var s OCSession
+func (c *Client) CreateSession(ctx context.Context) (*Session, error) {
+	var s Session
 	err := c.doJSON(ctx, http.MethodPost, "/session", map[string]any{}, &s)
 	if err != nil {
 		return nil, err
@@ -112,11 +145,11 @@ func (c *OCClient) CreateSession(ctx context.Context) (*OCSession, error) {
 	return &s, nil
 }
 
-func (c *OCClient) ListSessions(ctx context.Context, limit int) ([]OCSession, error) {
+func (c *Client) ListSessions(ctx context.Context, limit int) ([]Session, error) {
 	if limit <= 0 {
 		limit = 100
 	}
-	var list []OCSession
+	var list []Session
 	// limit سمت سرور اعمال می‌شود؛ سرور به‌ترتیب «آخرین فعالیت» برمی‌گرداند
 	if err := c.doJSON(ctx, http.MethodGet, "/session?limit="+strconv.Itoa(limit), nil, &list); err != nil {
 		return nil, err
@@ -125,7 +158,7 @@ func (c *OCClient) ListSessions(ctx context.Context, limit int) ([]OCSession, er
 }
 
 // DeleteSession نشست و تمام داده‌هایش را روی سرور حذف می‌کند
-func (c *OCClient) DeleteSession(ctx context.Context, id string) error {
+func (c *Client) DeleteSession(ctx context.Context, id string) error {
 	err := c.doJSON(ctx, http.MethodDelete, "/session/"+url.PathEscape(id), nil, nil)
 	if err != nil && strings.Contains(err.Error(), "404") {
 		// از قبل حذف شده؛ اشکالی ندارد
@@ -134,15 +167,15 @@ func (c *OCClient) DeleteSession(ctx context.Context, id string) error {
 	return err
 }
 
-func (c *OCClient) GetSession(ctx context.Context, id string) (*OCSession, error) {
-	var s OCSession
+func (c *Client) GetSession(ctx context.Context, id string) (*Session, error) {
+	var s Session
 	if err := c.doJSON(ctx, http.MethodGet, "/session/"+url.PathEscape(id), nil, &s); err != nil {
 		return nil, err
 	}
 	return &s, nil
 }
 
-func (c *OCClient) PromptAsync(ctx context.Context, sessionID, prompt, agent string) error {
+func (c *Client) PromptAsync(ctx context.Context, sessionID, prompt, agent string) error {
 	if agent == "" {
 		agent = c.agent
 	}
@@ -154,8 +187,8 @@ func (c *OCClient) PromptAsync(ctx context.Context, sessionID, prompt, agent str
 		"/session/"+url.PathEscape(sessionID)+"/prompt_async", body, nil)
 }
 
-func (c *OCClient) LastMessage(ctx context.Context, sessionID string) (*OCMessage, error) {
-	var list []OCMessage
+func (c *Client) LastMessage(ctx context.Context, sessionID string) (*Message, error) {
+	var list []Message
 	err := c.doJSON(ctx, http.MethodGet,
 		"/session/"+url.PathEscape(sessionID)+"/message?limit=1", nil, &list)
 	if err != nil {
@@ -168,11 +201,11 @@ func (c *OCClient) LastMessage(ctx context.Context, sessionID string) (*OCMessag
 }
 
 // ListMessages فهرست پیام‌های نشست (قدیمی→جدید)؛ limit تعداد پیام‌های آخر
-func (c *OCClient) ListMessages(ctx context.Context, sessionID string, limit int) ([]OCMessage, error) {
+func (c *Client) ListMessages(ctx context.Context, sessionID string, limit int) ([]Message, error) {
 	if limit <= 0 {
 		limit = 100
 	}
-	var list []OCMessage
+	var list []Message
 	err := c.doJSON(ctx, http.MethodGet,
 		"/session/"+url.PathEscape(sessionID)+"/message?limit="+strconv.Itoa(limit), nil, &list)
 	if err != nil {
@@ -181,51 +214,26 @@ func (c *OCClient) ListMessages(ctx context.Context, sessionID string, limit int
 	return list, nil
 }
 
-func (c *OCClient) Abort(ctx context.Context, sessionID string) error {
+func (c *Client) Abort(ctx context.Context, sessionID string) error {
 	return c.doJSON(ctx, http.MethodPost,
 		"/session/"+url.PathEscape(sessionID)+"/abort", nil, nil)
 }
 
-// ---------- سؤال‌های تعاملی (مثل CLI خود opencode) ----------
-
-type QOption struct {
-	Label       string `json:"label"`
-	Description string `json:"description"`
-}
-
-type QInfo struct {
-	Question string    `json:"question"`
-	Header   string    `json:"header"`
-	Options  []QOption `json:"options"`
-	Multiple bool      `json:"multiple,omitempty"`
-	Custom   *bool     `json:"custom,omitempty"` // nil یعنی true (پاسخ آزاد مجاز)
-}
-
-type QRequest struct {
-	ID        string  `json:"id"`
-	SessionID string  `json:"sessionID"`
-	Questions []QInfo `json:"questions"`
-	Tool      *struct {
-		MessageID string `json:"messageID"`
-		CallID    string `json:"callID"`
-	} `json:"tool,omitempty"`
-}
-
-func (c *OCClient) ListQuestions(ctx context.Context) ([]QRequest, error) {
-	var list []QRequest
+func (c *Client) ListQuestions(ctx context.Context) ([]QuestionRequest, error) {
+	var list []QuestionRequest
 	if err := c.doJSON(ctx, http.MethodGet, "/question", nil, &list); err != nil {
 		return nil, err
 	}
 	return list, nil
 }
 
-func (c *OCClient) ReplyQuestion(ctx context.Context, requestID string, answers [][]string) error {
+func (c *Client) ReplyQuestion(ctx context.Context, requestID string, answers [][]string) error {
 	body := map[string]any{"answers": answers}
 	return c.doJSON(ctx, http.MethodPost,
 		"/question/"+url.PathEscape(requestID)+"/reply", body, nil)
 }
 
-func (c *OCClient) RejectQuestion(ctx context.Context, requestID string) error {
+func (c *Client) RejectQuestion(ctx context.Context, requestID string) error {
 	return c.doJSON(ctx, http.MethodPost,
 		"/question/"+url.PathEscape(requestID)+"/reject", nil, nil)
 }

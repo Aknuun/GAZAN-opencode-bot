@@ -1,7 +1,7 @@
 package main
 
 import (
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -10,24 +10,29 @@ import (
 )
 
 func main() {
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	slog.SetDefault(logger)
+
 	cfg, err := loadConfig()
 	if err != nil {
-		log.Fatalf("config: %v", err)
+		slog.Error("بارگذاری تنظیمات ناموفق بود", "error", err)
+		os.Exit(1)
 	}
 	api, err := tgbotapi.NewBotAPI(cfg.Token)
 	if err != nil {
-		log.Fatalf("تلگرام: %v", err)
+		slog.Error("اتصال به تلگرام ناموفق بود", "error", err)
+		os.Exit(1)
 	}
-	log.Printf("ربات با نام %s متصل شد", api.Self.UserName)
+	slog.Info("ربات متصل شد", "bot", api.Self.UserName)
 
 	bot := newBot(cfg, api)
 	if err := bot.loadStates(); err != nil {
-		log.Printf("هشدار: بارگذاری state ناموفق: %v", err)
+		slog.Warn("بارگذاری state ناموفق بود", "error", err)
 	}
 	// پیش‌بارگذاری کاتالوگ مدل‌ها تا اولین باز شدن تنظیمات معطل نکند
 	go func() {
 		if _, err := bot.cat.providers(); err != nil {
-			log.Printf("هشدار: پیش‌بارگذاری کاتالوگ مدل‌ها ناموفق: %v", err)
+			slog.Warn("پیش‌بارگذاری کاتالوگ مدل‌ها ناموفق بود", "error", err)
 		}
 	}()
 
@@ -43,7 +48,10 @@ func main() {
 		case upd := <-updates:
 			bot.Handle(upd)
 		case <-stop:
-			log.Println("خروج…")
+			slog.Info("سیگنال خروج دریافت شد؛ ذخیرهٔ state…")
+			if err := bot.close(); err != nil {
+				slog.Warn("ذخیرهٔ نهایی state ناموفق بود", "error", err)
+			}
 			return
 		}
 	}

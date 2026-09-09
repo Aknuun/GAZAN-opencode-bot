@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+
+	"opencode-tg-bot/internal/occlient"
 )
 
 // ---------- سؤال تعاملی مثل CLI خود opencode ----------
@@ -34,36 +37,47 @@ type pendingQ struct {
 	reqID  string
 	chatID int64
 	msgID  int
-	info   []QInfo
+	info   []occlient.QuestionInfo
 	sel    [][]string // پاسخ هر سؤال = فهرست برچسبهای انتخابشده
 	idx    int        // سؤالِ در حال پاسخ (از 0)
 	mode   string     // "choice" | "text"
 	ev     chan qEvent
 }
 
-func (b *Bot) qNewToken() string {
-	b.qmu.Lock()
-	defer b.qmu.Unlock()
-	b.qseq++
-	return fmt.Sprintf("q%x%x", uint32(time.Now().UnixNano()), b.qseq&0xffff)
+// qReg ثبت سؤال‌های تعاملی در انتظار پاسخ؛ توکن کوتاه → pendingQ.
+type qReg struct {
+	mu   sync.Mutex
+	qmap map[string]*pendingQ
+	seq  int64
 }
 
-func (b *Bot) qPut(p *pendingQ) {
-	b.qmu.Lock()
-	defer b.qmu.Unlock()
-	b.qmap[p.token] = p
+func newQReg() *qReg {
+	return &qReg{qmap: map[string]*pendingQ{}}
 }
 
-func (b *Bot) qByToken(token string) *pendingQ {
-	b.qmu.Lock()
-	defer b.qmu.Unlock()
-	return b.qmap[token]
+func (q *qReg) newToken() string {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.seq++
+	return fmt.Sprintf("q%x%x", uint32(time.Now().UnixNano()), q.seq&0xffff)
 }
 
-func (b *Bot) qForChat(chatID int64) *pendingQ {
-	b.qmu.Lock()
-	defer b.qmu.Unlock()
-	for _, p := range b.qmap {
+func (q *qReg) put(p *pendingQ) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.qmap[p.token] = p
+}
+
+func (q *qReg) byToken(token string) *pendingQ {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.qmap[token]
+}
+
+func (q *qReg) forChat(chatID int64) *pendingQ {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for _, p := range q.qmap {
 		if p.chatID == chatID {
 			return p
 		}
@@ -71,24 +85,16 @@ func (b *Bot) qForChat(chatID int64) *pendingQ {
 	return nil
 }
 
-func (b *Bot) qDel(token string) {
-	b.qmu.Lock()
-	defer b.qmu.Unlock()
-	delete(b.qmap, token)
+func (q *qReg) del(token string) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	delete(q.qmap, token)
 }
 
 func (b *Bot) qCleanup(p *pendingQ) {
-	b.qDel(p.token)
-	// اگر در حالت «پاسخ آزاد» بودیم، pending ثبتشده را پاک کن
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	for _, st := range b.states {
-		if st.Pending == "qtext:"+p.token {
-			st.Pending = ""
-			b.saveStates()
-			break
-		}
-	}
+	b.qs.del(p.token)
+	// اگر در حالت «پاسخ آزاد» بودیم، pending ثبت‌شده را پاک کن
+	b.users.clearPendingToken(p.token)
 }
 
 func (b *Bot) qSendEvent(p *pendingQ, ev qEvent) {
@@ -98,7 +104,7 @@ func (b *Bot) qSendEvent(p *pendingQ, ev qEvent) {
 	}
 }
 
-func customAllowed(q QInfo) bool {
+func customAllowed(q occlient.QuestionInfo) bool {
 	return q.Custom == nil || *q.Custom
 }
 
@@ -139,7 +145,7 @@ func (b *Bot) answerQuestion(ctx context.Context, r *runCtl, progressMsg int, pa
 		return false
 	}
 	p := &pendingQ{
-		token:  b.qNewToken(),
+		token:  b.qs.newToken(),
 		sid:    r.SID,
 		reqID:  req.ID,
 		chatID: r.ChatID,
@@ -149,7 +155,7 @@ func (b *Bot) answerQuestion(ctx context.Context, r *runCtl, progressMsg int, pa
 		mode:   "choice",
 		ev:     make(chan qEvent, 16),
 	}
-	b.qPut(p)
+	b.qs.put(p)
 	defer b.qCleanup(p)
 
 	b.renderQ(p, partial)
@@ -167,7 +173,7 @@ func (b *Bot) answerQuestion(ctx context.Context, r *runCtl, progressMsg int, pa
 
 // waitQuestionReq درخواست سؤالِ متعلق به همین پیام/نشست را پیدا میکند.
 // ابزارِ سؤال ممکن است کمی دیرتر در فهرست /question ثبت شود، پس چند بار تلاش میکنیم.
-func (b *Bot) waitQuestionReq(ctx context.Context, sid, msgID string) (*QRequest, bool) {
+func (b *Bot) waitQuestionReq(ctx context.Context, sid, msgID string) (*occlient.QuestionRequest, bool) {
 	for i := 0; i < 8; i++ {
 		if ctx.Err() != nil {
 			return nil, false
@@ -178,7 +184,7 @@ func (b *Bot) waitQuestionReq(ctx context.Context, sid, msgID string) (*QRequest
 					return &qs[j], true
 				}
 			}
-			var sidMatch []*QRequest
+			var sidMatch []*occlient.QuestionRequest
 			for j := range qs {
 				if qs[j].SessionID == sid {
 					sidMatch = append(sidMatch, &qs[j])
@@ -328,7 +334,7 @@ func (b *Bot) onQCallback(chatID int64, data string) {
 		return
 	}
 	token, action := parts[1], parts[2]
-	p := b.qByToken(token)
+	p := b.qs.byToken(token)
 	if p == nil || p.chatID != chatID {
 		return
 	}

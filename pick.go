@@ -33,29 +33,19 @@ const (
 )
 
 func (b *Bot) setMlc(chatID int64, c modelsCtx) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.mlc[chatID] = c
+	b.ui.setModelsCtx(chatID, c)
 }
 
 func (b *Bot) getMlc(chatID int64) (modelsCtx, bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	c, ok := b.mlc[chatID]
-	return c, ok
+	return b.ui.modelsCtx(chatID)
 }
 
 func (b *Bot) setScx(chatID int64, c searchCtx) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.scx[chatID] = c
+	b.ui.setSearchCtx(chatID, c)
 }
 
 func (b *Bot) getScx(chatID int64) (searchCtx, bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	c, ok := b.scx[chatID]
-	return c, ok
+	return b.ui.searchCtx(chatID)
 }
 
 func (b *Bot) sendOrEdit(chatID int64, msgID int, text string, kb *tgbotapi.InlineKeyboardMarkup) {

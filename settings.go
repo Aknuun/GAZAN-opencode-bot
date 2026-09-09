@@ -12,27 +12,27 @@ import (
 
 // paidProviders: این‌ها پولی هستند و علامت نارنجی می‌گیرند
 var paidProviders = map[string]bool{
-	"anthropic": true,
-	"openai":    true,
-	"google":    true,
-	"xai":       true,
+	"anthropic":  true,
+	"openai":     true,
+	"google":     true,
+	"xai":        true,
 	"openrouter": true,
-	"mistral":   true,
-	"groq":      true,
-	"together":  true,
-	"sambanova": true,
-	"nvidia":    true,
-	"deepinfra": true,
+	"mistral":    true,
+	"groq":       true,
+	"together":   true,
+	"sambanova":  true,
+	"nvidia":     true,
+	"deepinfra":  true,
 	"perplexity": true,
-	"fireworks": true,
-	"cerebras":  true,
-	"bedrock":   true,
-	"vertex":    true,
-	"cloudflare":true,
-	"replicate": true,
-	"ai21":      true,
-	"cohere":    true,
-	"jina":      true,
+	"fireworks":  true,
+	"cerebras":   true,
+	"bedrock":    true,
+	"vertex":     true,
+	"cloudflare": true,
+	"replicate":  true,
+	"ai21":       true,
+	"cohere":     true,
+	"jina":       true,
 }
 
 func isPaidProvider(pid string) bool {
@@ -112,7 +112,7 @@ func (b *Bot) settingsSummary(env *ocEnv, userID, chatID int64) string {
 		}
 		sb.WriteString("🔑 کلیدهای ست‌شده: <code>" + strings.Join(providers, ", ") + "</code>" + state + "\n")
 	}
-	sb.WriteString("🤖 agent: <code>" + b.agentForCurrent(userID, chatID) + "</code>\n")
+	sb.WriteString("🤖 agent: <code>" + b.agentForCurrent(userID) + "</code>\n")
 	if env.Service != "" {
 		sb.WriteString("🛠 سرویس: <code>" + env.Service + "</code>\n")
 	} else {
@@ -122,14 +122,8 @@ func (b *Bot) settingsSummary(env *ocEnv, userID, chatID int64) string {
 	return sb.String()
 }
 
-func (b *Bot) agentForCurrent(userID, chatID int64) string {
-	if st := b.stateFor(userID, chatID); st != nil && st.Agent != "" {
-		return st.Agent
-	}
-	if b.cfg != nil && b.cfg.Agent != "" {
-		return b.cfg.Agent
-	}
-	return "build"
+func (b *Bot) agentForCurrent(userID int64) string {
+	return b.agentFor(userID)
 }
 
 func (b *Bot) agentOptions(env *ocEnv) []string {
@@ -313,10 +307,8 @@ func (b *Bot) showAgentPicker(chatID int64, msgID int) {
 }
 
 func (b *Bot) setAgentFromCallback(userID, chatID int64, msgID int, agent string) {
-	if st := b.stateFor(userID, chatID); st != nil {
-		st.Agent = agent
-		b.saveStates()
-	}
+	b.stateFor(userID, chatID)
+	b.setAgentValue(userID, agent)
 	b.editSettings(chatID, msgID, "✅ agent فعال: <code>"+agent+"</code>", settingsMainMarkup())
 }
 
@@ -355,29 +347,17 @@ func (b *Bot) restartAfter(chatID int64) {
 // ---------- pending (تایپ متنی) ----------
 
 func (b *Bot) setPendingByChat(chatID int64, pending string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	for _, st := range b.states {
-		if st.ChatID == chatID {
-			st.Pending = pending
-			b.saveStates()
-			return
-		}
-	}
+	b.users.setPending(chatID, pending)
 }
 
-func (b *Bot) clearPending(st *UserState) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	st.Pending = ""
-	b.saveStates()
+func (b *Bot) clearPending(userID int64) {
+	b.users.clearPending(userID)
 }
 
 func (b *Bot) handlePending(userID, chatID int64, pending, text string) {
 	text = strings.TrimSpace(text)
 	env := b.envFor()
-	st := b.stateFor(userID, chatID)
-	defer b.clearPending(st)
+	defer b.clearPending(userID)
 	parts := strings.SplitN(pending, ":", 2)
 	kind := parts[0]
 	arg := ""
@@ -387,7 +367,7 @@ func (b *Bot) handlePending(userID, chatID int64, pending, text string) {
 	switch kind {
 	case "qtext":
 		// پاسخِ آزاد کاربر به سؤالِ تعاملی مدل
-		p := b.qByToken(arg)
+		p := b.qs.byToken(arg)
 		if p == nil || p.chatID != chatID {
 			b.send(chatID, "دیگر در انتظار پاسخی نیست.")
 			return

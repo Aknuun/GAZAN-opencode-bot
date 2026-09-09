@@ -35,14 +35,14 @@ func TestRenumberAfterDelete(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &Config{BaseURL: "http://127.0.0.1:1", StateFile: dir + "/state.json"}
 	b := newBot(cfg, nil)
-	b.states[1] = &UserState{
+	b.users.states[1] = &UserState{
 		UserID:    1,
 		Sessions:  []string{"a", "b", "c"},
 		Labels:    map[string]string{"a": "۱", "b": "۲", "c": "۳"},
 		SessionID: "b",
 	}
 	b.deleteSession(1, "b")
-	st := b.states[1]
+	st := b.users.states[1]
 	if st.Labels["a"] != "۱" || st.Labels["c"] != "۲" {
 		t.Fatalf("labels=%v", st.Labels)
 	}
@@ -55,9 +55,9 @@ func TestSetSessionLabelMarksManual(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &Config{BaseURL: "http://127.0.0.1:1", StateFile: dir + "/state.json"}
 	b := newBot(cfg, nil)
-	b.states[1] = &UserState{UserID: 1, Sessions: []string{"a"}}
+	b.users.states[1] = &UserState{UserID: 1, Sessions: []string{"a"}}
 	b.setSessionLabel(1, "a", "مدل جدید")
-	st := b.states[1]
+	st := b.users.states[1]
 	if st.Labels["a"] != "مدل جدید" || !st.Manual["a"] {
 		t.Fatalf("labels=%v manual=%v", st.Labels, st.Manual)
 	}
@@ -66,4 +66,36 @@ func TestSetSessionLabelMarksManual(t *testing.T) {
 	if st.Labels["a"] != "مدل جدید" {
 		t.Fatalf("manual label overwritten: %q", st.Labels["a"])
 	}
+}
+
+func TestPersistRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/state.json"
+	cfg := &Config{BaseURL: "http://127.0.0.1:1", StateFile: path}
+	b := newBot(cfg, nil)
+	b.users.states[1] = &UserState{
+		UserID:    1,
+		ChatID:    99,
+		Sessions:  []string{"a", "b"},
+		Labels:    map[string]string{"a": "۱", "b": "نام"},
+		Manual:    map[string]bool{"b": true},
+		SessionID: "b",
+	}
+	b.users.saver.MarkDirty()
+	if err := b.users.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// بازخوانی از دیسک
+	b2 := newBot(&Config{BaseURL: "http://127.0.0.1:1", StateFile: path}, nil)
+	if err := b2.users.load(); err != nil {
+		t.Fatal(err)
+	}
+	st := b2.users.byID(1)
+	if st == nil || st.SessionID != "b" || len(st.Sessions) != 2 {
+		t.Fatalf("roundtrip failed: %+v", st)
+	}
+	if st.Labels["b"] != "نام" || !st.Manual["b"] {
+		t.Fatalf("labels lost: %+v", st)
+	}
+	b2.users.Close()
 }
