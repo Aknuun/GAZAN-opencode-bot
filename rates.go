@@ -310,11 +310,11 @@ func (b *Bot) costText(usd float64) string {
 	return base
 }
 
-// costButton متن دکمهٔ «وضعیت و هزینه»: بدون توکن، با دلار و تومان.
+// costButton متن دکمهٔ «وضعیت و هزینه»: دلار بالا، عدد تومان پایین (بدون کلمهٔ تومان).
 func (b *Bot) costButton(usd float64) string {
 	base := fmt.Sprintf("$%.4f", usd)
-	if t := b.tomanText(usd); t != "" {
-		return base + " · " + t
+	if t := b.fx.tomanFor(usd); t > 0 {
+		return base + "\n" + faSep(t)
 	}
 	return base
 }
