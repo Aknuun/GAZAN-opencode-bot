@@ -14,8 +14,8 @@ var faMonths = [...]string{
 	"مهر", "آبان", "آذر", "دی", "بهمن", "اسفند",
 }
 
-// createdTimeLabel زمان ساخت نشست (epoch میلی‌ثانیه) را به «روز ماه ساعت:دقیقه» شمسیِ ایران تبدیل می‌کند
-func createdTimeLabel(ms int64, now time.Time) string {
+// persianTimeLabel یک لحظه (epoch میلی‌ثانیه) را به «روز ماه ساعت:دقیقه» شمسیِ ایران تبدیل می‌کند
+func persianTimeLabel(ms int64, now time.Time) string {
 	t := ptime.New(time.Unix(ms/1000, (ms%1000)*int64(time.Millisecond)).In(tehranLoc))
 	label := faNum(t.Day()) + " " + faMonths[t.Month()-1]
 	if cur := ptime.New(now.In(tehranLoc)); t.Year() != cur.Year() {

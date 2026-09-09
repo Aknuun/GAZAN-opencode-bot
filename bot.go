@@ -93,7 +93,7 @@ type Bot struct {
 	states map[int64]*UserState
 	runs   map[string]*runCtl // کلید = نشست opencode
 	cost   map[int64]costInfo
-	stm    map[string]int64 // زمان ساخت نشست (epoch ms) — برای برچسب خودکار تاریخ‌دار
+	act    map[string]int64 // زمان آخرین فعالیت نشست (epoch ms) — برای برچسب خودکار تاریخ‌دار
 
 	qmu  sync.Mutex
 	qmap map[string]*pendingQ // توکن کوتاه → سؤال در انتظار پاسخ
@@ -120,7 +120,7 @@ func newBot(cfg *Config, api *tgbotapi.BotAPI) *Bot {
 		states: map[int64]*UserState{},
 		runs:   map[string]*runCtl{},
 		cost:   map[int64]costInfo{},
-		stm:    map[string]int64{},
+		act:    map[string]int64{},
 		qmap:   map[string]*pendingQ{},
 		cat:    newModelCatalog(filepath.Join(filepath.Dir(cfg.StateFile), "catalog-models.json")),
 		mlc:    map[int64]modelsCtx{},
@@ -192,15 +192,15 @@ func renumberAutoLabels(st *UserState) {
 }
 
 // sessionLabel نام نمایشی نشست؛ نام دستی کاربر همان می‌ماند و نام خودکار
-// به «تاریخ و ساعت ساخت» (شمسی، به وقت ایران) تبدیل می‌شود.
+// به «تاریخ و ساعت آخرین فعالیت» (شمسی، به وقت ایران) تبدیل می‌شود.
 func (b *Bot) sessionLabel(st *UserState, sid string) string {
 	if st.Manual != nil && st.Manual[sid] {
 		if l := st.Labels[sid]; l != "" {
 			return l
 		}
 	}
-	if ms, ok := b.createdOf(sid); ok {
-		return createdTimeLabel(ms, time.Now())
+	if ms, ok := b.lastActivityOf(sid); ok {
+		return persianTimeLabel(ms, time.Now())
 	}
 	if st.Labels != nil {
 		if l := st.Labels[sid]; l != "" {
@@ -215,34 +215,42 @@ func (b *Bot) sessionLabel(st *UserState, sid string) string {
 	return shortSID(sid)
 }
 
-// createdOf زمان ساخت نشست را از کش برمی‌گرداند
-func (b *Bot) createdOf(sid string) (int64, bool) {
+// lastActivityOf زمان آخرین فعالیت نشست را از کش برمی‌گرداند
+func (b *Bot) lastActivityOf(sid string) (int64, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	t, ok := b.stm[sid]
+	t, ok := b.act[sid]
 	return t, ok
 }
 
-// setCreated زمان ساخت نشست را در کش ثبت می‌کند
-func (b *Bot) setCreated(sid string, ms int64) {
+// setLastActivity زمان آخرین فعالیت نشست را در کش ثبت می‌کند
+func (b *Bot) setLastActivity(sid string, ms int64) {
 	if sid == "" || ms <= 0 {
 		return
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.stm[sid] = ms
+	b.act[sid] = ms
 }
 
-// rememberTimes زمان ساخت همهٔ نشست‌های فهرست سرور را در کش ثبت می‌کند
-func (b *Bot) rememberTimes(list []OCSession) {
+// lastActivityOfOC آخرین فعالیت یک نشست سرور را می‌دهد؛ اگر سرور آن را ندهد به زمان ساخت برمی‌گردد
+func lastActivityOfOC(s *OCSession) int64 {
+	if s.Time.Updated > 0 {
+		return s.Time.Updated
+	}
+	return s.Time.Created
+}
+
+// rememberActivity زمان آخرین فعالیت همهٔ نشست‌های فهرست سرور را در کش ثبت می‌کند
+func (b *Bot) rememberActivity(list []OCSession) {
 	if len(list) == 0 {
 		return
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for _, s := range list {
-		if s.Time.Created > 0 {
-			b.stm[s.ID] = s.Time.Created
+		if ms := lastActivityOfOC(&s); ms > 0 {
+			b.act[s.ID] = ms
 		}
 	}
 }
@@ -781,7 +789,7 @@ func (b *Bot) newSession(userID, chatID int64) {
 		b.send(chatID, "ساخت نشست ممکن نشد: "+err.Error())
 		return
 	}
-	b.setCreated(s.ID, s.Time.Created)
+	b.setLastActivity(s.ID, lastActivityOfOC(s))
 	b.setSession(userID, s.ID)
 	st := b.stateFor(userID, chatID)
 	b.send(chatID, "نشست جدید ساخته و فعال شد.\n"+b.sessionLabel(st, s.ID)+"\n"+s.ID)
@@ -1252,7 +1260,7 @@ func (b *Bot) sessionsPage(userID, chatID int64, msgID, page int) {
 	cancel()
 	var warn error
 	if err == nil {
-		b.rememberTimes(list)
+		b.rememberActivity(list)
 		b.syncLiveSessions(st, list)
 	} else {
 		warn = err
