@@ -62,7 +62,7 @@ const helpText = `ربات کنترل opencode روی سرور
 اگر مدل در میانهٔ کار سؤالی بپرسد (مثل خود CLI)، همان پیام گزینه‌ها را دارد؛ با دکمه‌ها پاسخ بده تا اجرا ادامه یابد. ✏️ یعنی می‌توانی پاسخ خودت را تایپ کنی.`
 
 // botVersion نسخهٔ ربات است؛ هنگام انتشار نسخهٔ جدید آن را به‌روز کن
-const botVersion = "v8.5"
+const botVersion = "v8.6"
 
 const (
 	btnStatus    = "وضعیت و هزینه"
@@ -1018,6 +1018,23 @@ func (b *Bot) useSession(userID, chatID int64, sid string) {
 	name := b.sessionLabel(userID, sid)
 	full := "✅ نشست فعال شد: " + name + "\n" + sid + "\n\n" + b.sessionTopicsText(sid)
 	b.sendChunks(chatID, full, 0)
+	b.sessionActions(chatID, sid)
+}
+
+// sessionActions نوار اکشن زیر توضیحات نشستِ بازشده: تغییر نام، حذف و (اگر در
+// حال اجراست) توقف. زدن «تغییر نام» مسیر ss:rn را ادامه می‌دهد.
+func (b *Bot) sessionActions(chatID int64, sid string) {
+	var btns [][]tgbotapi.InlineKeyboardButton
+	btns = append(btns, []tgbotapi.InlineKeyboardButton{
+		inlineBtn("✏️ تغییر نام", "ss:rn:"+sid),
+		inlineBtn("🗑 حذف نشست", "ss:del:"+sid),
+	})
+	if b.isRunning(sid) {
+		btns = append(btns, []tgbotapi.InlineKeyboardButton{inlineBtn("⏹ توقف اجرا", "ss:stop:"+sid)})
+	}
+	act := tgbotapi.NewMessage(chatID, "📌 این نشست چه‌کاری؟")
+	act.ReplyMarkup = rowsOf(btns...)
+	b.api.Send(act)
 }
 
 // sessionTopicsText موضوعاتی که تاکنون در نشست مطرح شده‌اند (یک مورد برای هر پیام کاربر)
@@ -1206,7 +1223,7 @@ func (b *Bot) sessionsPage(userID, chatID int64, msgID, page int) {
 	if group {
 		sb.WriteString("\nروی هر نشست بزن تا انتخاب/لغو شود، بعد «🗑 حذف انتخاب‌ها» را بزن.")
 	} else {
-		sb.WriteString("\nفهرست همان نشست‌های واقعی سرور است؛ 🗑 نشست را روی سرور هم برای همیشه حذف می‌کند.")
+		sb.WriteString("\nبرای دیدن جزئیات و تغییر نام، روی نام نشست بزن. 🗑 حذف، نشست را روی سرور هم برای همیشه پاک می‌کند.")
 	}
 
 	var rows [][]tgbotapi.InlineKeyboardButton
@@ -1221,13 +1238,12 @@ func (b *Bot) sessionsPage(userID, chatID int64, msgID, page int) {
 			rows = append(rows, []tgbotapi.InlineKeyboardButton{inlineBtn(mark+" "+clipHead(label, 24), "ss:gtgl:"+sid)})
 			continue
 		}
-		row := []tgbotapi.InlineKeyboardButton{}
+		// دکمهٔ درازِ نام نشست (باز کردن جزئیات)؛ اگر فعال است تیک می‌خورد
+		mark := ""
 		if sid == active {
-			row = append(row, inlineBtn("✓ "+clipHead(label, 18), "ss:noop"))
-		} else {
-			row = append(row, inlineBtn("➡️ "+clipHead(label, 18), "ss:use:"+sid))
+			mark = "✓ "
 		}
-		row = append(row, inlineBtn("✏️", "ss:rn:"+sid))
+		row := []tgbotapi.InlineKeyboardButton{inlineBtn(mark+clipHead(label, 26), "ss:use:"+sid)}
 		if _, running := b.runFor(sid); running {
 			row = append(row, inlineBtn("⏹", "ss:stop:"+sid))
 		}
