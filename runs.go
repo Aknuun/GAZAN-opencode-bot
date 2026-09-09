@@ -5,13 +5,12 @@ import "sync"
 // runManager مالک اجراهای نشست‌هاست و آن‌ها را زیر قفل خودش نگه می‌دارد.
 // فقط یک اجرا در یک زمان مجاز است (تک‌کاره).
 type runManager struct {
-	mu        sync.Mutex
-	runs      map[string]*runCtl   // کلید = نشست opencode
-	approvals map[string]chan bool // sid → کانال تأییدِ طرح (هنگام انتظار «شروع کن؟»)
+	mu   sync.Mutex
+	runs map[string]*runCtl // کلید = نشست opencode
 }
 
 func newRunManager() *runManager {
-	return &runManager{runs: map[string]*runCtl{}, approvals: map[string]chan bool{}}
+	return &runManager{runs: map[string]*runCtl{}}
 }
 
 func (m *runManager) get(sid string) (*runCtl, bool) {
@@ -56,25 +55,6 @@ func (m *runManager) add(r *runCtl) {
 	m.runs[r.SID] = r
 }
 
-// setApproval کانال تأیید را برای نشست ثبت می‌کند (هنگام انتظار «شروع کن؟»).
-func (m *runManager) setApproval(sid string, ch chan bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.approvals[sid] = ch
-}
-
-func (m *runManager) approval(sid string) chan bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.approvals[sid]
-}
-
-func (m *runManager) clearApproval(sid string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.approvals, sid)
-}
-
 // remove اجرا را حذف و کانال done آن را می‌بندد (هر اجرا فقط یک‌بار).
 func (m *runManager) remove(sid string) {
 	m.mu.Lock()
@@ -83,7 +63,6 @@ func (m *runManager) remove(sid string) {
 		close(r.done)
 		delete(m.runs, sid)
 	}
-	delete(m.approvals, sid)
 }
 
 // abortAll همهٔ اجراها را لغو می‌کند (بعد از ری‌استارت سرور که اجراهای قبلی
@@ -95,8 +74,5 @@ func (m *runManager) abortAll() {
 		r.cancel()
 		close(r.done)
 		delete(m.runs, id)
-	}
-	for sid := range m.approvals {
-		delete(m.approvals, sid)
 	}
 }

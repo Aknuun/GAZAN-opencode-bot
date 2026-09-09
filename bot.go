@@ -62,7 +62,7 @@ const helpText = `ربات کنترل opencode روی سرور
 اگر مدل در میانهٔ کار سؤالی بپرسد (مثل خود CLI)، همان پیام گزینه‌ها را دارد؛ با دکمه‌ها پاسخ بده تا اجرا ادامه یابد. ✏️ یعنی می‌توانی پاسخ خودت را تایپ کنی.`
 
 // botVersion نسخهٔ ربات است؛ هنگام انتشار نسخهٔ جدید آن را به‌روز کن
-const botVersion = "v8.7"
+const botVersion = "v8.8"
 
 const (
 	btnStatus    = "وضعیت و هزینه"
@@ -437,7 +437,6 @@ var cbRoutes = []cbRoute{
 	{prefix: "ss:", run: sessionsAction},
 	{prefix: "qa:", run: questionAction},
 	{prefix: "stop:", run: stopRunAction},
-	{prefix: "cf:", run: confirmAction},
 	{prefix: "cnt:", run: continueAction},
 }
 
@@ -677,10 +676,6 @@ func (b *Bot) submitPrompt(userID, chatID int64, prompt string) {
 			b.send(chatID, "مدل سؤالی پرسیده؛ با دکمه‌های همان پیام پاسخ بده (یا ✏️ بنویس).")
 			return
 		}
-		if sid := b.runs.activeSID(); sid != "" && b.runs.approval(sid) != nil {
-			b.send(chatID, "منتظر تأیید طرح هستم؛ با دکمهٔ «✔️ شروع کن» یا «✖️ لغو» همان پیام تصمیم بگیر.")
-			return
-		}
 		b.askStopOrContinue(userID, chatID)
 		return
 	}
@@ -700,49 +695,25 @@ func (b *Bot) submitPrompt(userID, chatID int64, prompt string) {
 	go b.runTask(ctx, r, prompt)
 }
 
-// runTask کار را در دو فاز انجام می‌دهد: اول با agent=plan «طرح پیشنهادی» می‌دهد،
-// بعد از تأییدِ کاربر همان درخواست را با agent انتخابی اجرا می‌کند.
+// runTask درخواست را مستقیم با agent انتخابی اجرا می‌کند (بدون مرحلهٔ طرح/تأیید).
 func (b *Bot) runTask(ctx context.Context, r *runCtl, prompt string) {
 	defer b.delRun(r.SID)
 
 	agent := b.agentFor(r.UserID)
-	pre, preOK := b.sessionUsage(r.SID)
-
-	// ---------- فاز ۱: برنامه‌ریزی (بدون تغییر فایل) ----------
-	prog, err := b.sendProgress(r.ChatID, "در حال برنامه‌ریزی…", r.SID)
+	prog, err := b.sendProgress(r.ChatID, "در حال انجام…", r.SID)
 	if err != nil {
 		return
 	}
-	if err := b.oc.PromptAsync(ctx, r.SID, prompt, "plan"); err != nil {
-		b.edit(r.ChatID, prog, "شروع برنامه‌ریزی ناموفق بود: "+err.Error())
+
+	pre, preOK := b.sessionUsage(r.SID)
+	if err := b.oc.PromptAsync(ctx, r.SID, prompt, agent); err != nil {
+		b.edit(r.ChatID, prog, "ارسال دستور ناموفق بود: "+err.Error())
 		b.removeInline(r.ChatID, prog)
 		return
 	}
-	plan := b.poll(ctx, r, prog, pre.model)
-	if plan.outcome != outcomeDone {
-		// متوقف شد / خطا در مرحلهٔ طرح
-		b.sendChunks(r.ChatID, plan.text, prog)
-		return
-	}
-	b.sendChunks(r.ChatID, plan.text, prog)
 
-	// ---------- تأیید کاربر ----------
-	if !b.askConfirm(ctx, r) {
-		return
-	}
-
-	// ---------- فاز ۲: اجرا ----------
-	prog2, err := b.sendProgress(r.ChatID, "در حال انجام…", r.SID)
-	if err != nil {
-		return
-	}
-	if err := b.oc.PromptAsync(ctx, r.SID, prompt, agent); err != nil {
-		b.edit(r.ChatID, prog2, "شروع اجرا ناموفق بود: "+err.Error())
-		b.removeInline(r.ChatID, prog2)
-		return
-	}
-	res := b.poll(ctx, r, prog2, pre.model)
-	b.sendChunks(r.ChatID, res.text, prog2)
+	res := b.poll(ctx, r, prog, pre.model)
+	b.sendChunks(r.ChatID, res.text, prog)
 	// پیامِ جداگانهٔ خلاصه در زیر پاسخ: کار تمام شد + مصرف توکن/هزینه + جزئیات
 	b.sendRunSummary(r, res, pre, preOK)
 }
@@ -769,66 +740,6 @@ func (b *Bot) askStopOrContinue(userID, chatID int64) {
 		[]tgbotapi.InlineKeyboardButton{inlineBtn("▶️ ادامه بده", "cnt:"+sid)},
 	)
 	b.api.Send(msg)
-}
-
-// askConfirm طرح ارائه‌شده را با دکمه «شروع کن / لغو» از کاربر تأیید می‌گیرد.
-func (b *Bot) askConfirm(ctx context.Context, r *runCtl) bool {
-	ch := make(chan bool, 1)
-	b.runs.setApproval(r.SID, ch)
-	defer b.runs.clearApproval(r.SID)
-
-	msg := tgbotapi.NewMessage(r.ChatID, "این طرح را اجرا کنم؟\n(با اجرا، agent روی فایل‌ها و دستورها کار می‌کند.)")
-	msg.ReplyMarkup = rowsOf(
-		[]tgbotapi.InlineKeyboardButton{inlineBtn("✔️ شروع کن", "cf:"+r.SID+":yes")},
-		[]tgbotapi.InlineKeyboardButton{inlineBtn("✖️ لغو", "cf:"+r.SID+":no")},
-	)
-	m, err := b.api.Send(msg)
-	if err != nil {
-		return false
-	}
-
-	select {
-	case ok := <-ch:
-		title := "✖️ لغو شد."
-		if ok {
-			title = "✔️ شروع شد."
-		}
-		edit := tgbotapi.NewEditMessageText(r.ChatID, m.MessageID, title)
-		b.api.Send(edit)
-		return ok
-	case <-ctx.Done():
-		edit := tgbotapi.NewEditMessageText(r.ChatID, m.MessageID, "⛔ متوقف شد.")
-		b.api.Send(edit)
-		return false
-	case <-time.After(3 * time.Minute):
-		edit := tgbotapi.NewEditMessageText(r.ChatID, m.MessageID, "⏳ تأییدی دریافت نشد؛ کار لغو شد.")
-		b.api.Send(edit)
-		return false
-	}
-}
-
-// confirmAction دکمهٔ تأیید/لغو طرح (cf:<sid>:yes|no) را پردازش می‌کند.
-func confirmAction(b *Bot, cq *tgbotapi.CallbackQuery) {
-	parts := strings.SplitN(cq.Data, ":", 3)
-	if len(parts) != 3 {
-		return
-	}
-	sid := parts[1]
-	r, ok := b.runs.get(sid)
-	if !ok {
-		return
-	}
-	if r.ChatID != cq.Message.Chat.ID || r.UserID != cq.From.ID {
-		return
-	}
-	ch := b.runs.approval(sid)
-	if ch == nil {
-		return
-	}
-	select {
-	case ch <- parts[2] == "yes":
-	default:
-	}
 }
 
 // continueAction دکمهٔ «ادامه بده» اجرای در جریان را دست نمی‌زند.
