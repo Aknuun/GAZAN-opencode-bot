@@ -643,6 +643,29 @@ func (b *Bot) abortAllRuns() {
 
 // ---------- ارسال پرامپت و اجرا ----------
 
+// runOutcome نتیجهٔ نهایی یک اجراست.
+type runOutcome int
+
+const (
+	outcomeDone    runOutcome = iota // پاسخ کامل شد
+	outcomeStopped                   // کاربر (یا سؤال تعاملی) اجرا را متوقف کرد
+	outcomeError                     // قطع ارتباط / بی‌پاسخی / خطای دیگر
+)
+
+// pollResult خروجی حلقهٔ poll: متن نهایی + نتیجه + مدلِ استفاده‌شده.
+type pollResult struct {
+	outcome runOutcome
+	text    string
+	model   string
+}
+
+// usage آمار لحظه‌ای مصرف یک نشست.
+type usage struct {
+	in, out int
+	cost    float64
+	model   string
+}
+
 func (b *Bot) submitPrompt(userID, chatID int64, prompt string) {
 	if !b.ocReady() {
 		b.send(chatID, b.ocSetupHint())
@@ -686,17 +709,90 @@ func (b *Bot) runPrompt(ctx context.Context, r *runCtl, prompt string) {
 		return
 	}
 
+	// مصرف نشست قبل از اجرا تا بعداً مصرف همین اجرا حساب شود
+	pre, preOK := b.sessionUsage(r.SID)
+
 	if err := b.oc.PromptAsync(ctx, r.SID, prompt, agent); err != nil {
 		b.edit(r.ChatID, progressMsg, "ارسال دستور ناموفق بود: "+err.Error())
 		b.removeInline(r.ChatID, progressMsg)
 		return
 	}
 
-	final := b.poll(ctx, r, progressMsg)
-	b.sendChunks(r.ChatID, final, progressMsg)
+	res := b.poll(ctx, r, progressMsg, pre.model)
+	b.sendChunks(r.ChatID, res.text, progressMsg)
+	// پیامِ جداگانهٔ خلاصه در زیر پاسخ: کار تمام شد + مصرف توکن/هزینه + جزئیات
+	b.sendRunSummary(r, res, pre, preOK)
 }
 
-func (b *Bot) poll(ctx context.Context, r *runCtl, progressMsg int) string {
+// sessionUsage آمار فعلی مصرف نشست را از سرور می‌خواند.
+func (b *Bot) sessionUsage(sid string) (usage, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	s, err := b.oc.GetSession(ctx, sid)
+	if err != nil || s == nil {
+		return usage{}, false
+	}
+	return usage{in: s.Tokens.Input, out: s.Tokens.Output, cost: s.Cost, model: s.ModelID}, true
+}
+
+// sendRunSummary بعد از پایان هر اجرا یک پیام جدا زیر پاسخ می‌فرستد با نتیجه،
+// مدل، مدت و مصرف توکن/هزینهٔ همین اجرا.
+func (b *Bot) sendRunSummary(r *runCtl, res pollResult, pre usage, preOK bool) {
+	secs := int(time.Since(r.started).Seconds())
+
+	cur, curOK := b.sessionUsage(r.SID)
+	in, out := 0, 0
+	cost := 0.0
+	switch {
+	case curOK && preOK:
+		// تفاضل مصرفِ همین اجرا
+		in = cur.in - pre.in
+		out = cur.out - pre.out
+		cost = cur.cost - pre.cost
+		if in < 0 {
+			in = 0
+		}
+		if out < 0 {
+			out = 0
+		}
+		if cost < 0 {
+			cost = 0
+		}
+	case curOK:
+		// قبل از اجرا قابل خواندن نبود؛ کل مصرف نشست را نشان بده
+		in, out, cost = cur.in, cur.out, cur.cost
+	}
+
+	model := res.model
+	if model == "" && curOK {
+		model = cur.model
+	}
+
+	var sb strings.Builder
+	switch res.outcome {
+	case outcomeDone:
+		sb.WriteString("✅ کار انجام شد\n")
+	case outcomeStopped:
+		sb.WriteString("⛔ اجرا متوقف شد\n")
+	default:
+		sb.WriteString("⚠️ اجرا ناتمام ماند\n")
+	}
+	sb.WriteString("━━━━━━━━━━━━━━━━\n")
+	if model != "" {
+		fmt.Fprintf(&sb, "🧠 مدل: %s\n", model)
+	}
+	fmt.Fprintf(&sb, "🤖 agent: %s\n", b.agentFor(r.UserID))
+	fmt.Fprintf(&sb, "⏱ مدت: %s\n", durText(secs))
+	if curOK {
+		fmt.Fprintf(&sb, "🔢 توکن: ورودی %s · خروجی %s\n", abbrev(in), abbrev(out))
+		fmt.Fprintf(&sb, "💵 هزینه: $%.4f", cost)
+	} else {
+		sb.WriteString("💵 آمار هزینه در دسترس نبود")
+	}
+	b.send(r.ChatID, sb.String())
+}
+
+func (b *Bot) poll(ctx context.Context, r *runCtl, progressMsg int, startModel string) pollResult {
 	ticker := time.NewTicker(1500 * time.Millisecond)
 	defer ticker.Stop()
 	start := time.Now()
@@ -705,16 +801,17 @@ func (b *Bot) poll(ctx context.Context, r *runCtl, progressMsg int) string {
 	errCount := 0
 	lastSig := ""
 	lastChange := time.Now()
+	model := startModel
 	for {
 		select {
 		case <-ctx.Done():
-			return "⛔ متوقف شد."
+			return pollResult{outcome: outcomeStopped, text: "⛔ متوقف شد."}
 		case now := <-ticker.C:
 			msg, err := b.oc.LastMessage(ctx, r.SID)
 			if err != nil {
 				errCount++
 				if errCount > 5 {
-					return "⚠️ ارتباط با opencode قطع شد: " + err.Error()
+					return pollResult{outcome: outcomeError, text: "⚠️ ارتباط با opencode قطع شد: " + err.Error(), model: model}
 				}
 				continue
 			}
@@ -723,17 +820,20 @@ func (b *Bot) poll(ctx context.Context, r *runCtl, progressMsg int) string {
 			curText := ""
 			act := ""
 			if msg != nil && msg.Info.Role == "assistant" {
+				if msg.Info.ModelID != "" {
+					model = msg.Info.ModelID
+				}
 				curText = joinText(msg)
 				act = activityLabel(msg)
 				if isFinalFinish(msg.Info.Finish) {
 					if curText == "" {
 						curText = "⚠️ پاسخی دریافت نشد."
 					}
-					return curText
+					return pollResult{outcome: outcomeDone, text: curText, model: model}
 				}
 				if hasPendingQuestion(msg) {
 					if b.answerQuestion(ctx, r, progressMsg, curText, msg.Info.ID) {
-						return "⛔ متوقف شد."
+						return pollResult{outcome: outcomeStopped, text: "⛔ متوقف شد.", model: model}
 					}
 					// بعد از پاسخ به سؤال، وضعیت زنده را از نو نشان بده
 					lastShown = ""
@@ -751,7 +851,7 @@ func (b *Bot) poll(ctx context.Context, r *runCtl, progressMsg int) string {
 				lastSig = sig
 				lastChange = now
 			} else if now.Sub(lastChange) >= pollQuietLimit {
-				return "⚠️ بیش از " + pollQuietLimit.String() + " است که مدل هیچ پاسخ یا فعالیتی تولید نکرده؛ احتمالاً پروایدر مشکل دارد.\nبا /new یک نشست تازه بساز یا مدل را در ⚙️ تنظیمات عوض کن."
+				return pollResult{outcome: outcomeError, text: "⚠️ بیش از " + pollQuietLimit.String() + " است که مدل هیچ پاسخ یا فعالیتی تولید نکرده؛ احتمالاً پروایدر مشکل دارد.\nبا /new یک نشست تازه بساز یا مدل را در ⚙️ تنظیمات عوض کن.", model: model}
 			}
 
 			interval := 900 * time.Millisecond
@@ -760,7 +860,12 @@ func (b *Bot) poll(ctx context.Context, r *runCtl, progressMsg int) string {
 				interval = 2 * time.Second
 				label := act
 				if label == "" {
-					label = "🧠 در حال فکر کردن…"
+					// وقتی مدل دارد «فکر می‌کند»، اسمش را هم نشان بده
+					if model != "" {
+						label = "🧠 " + model + " در حال فکر کردن…"
+					} else {
+						label = "🧠 در حال فکر کردن…"
+					}
 				}
 				show = label + "\n⏳ " + durText(int(now.Sub(start).Seconds()))
 			}
