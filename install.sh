@@ -177,6 +177,7 @@ User=root
 WorkingDirectory=/root
 Environment=HOME=/root
 ExecStart=$OPENCODE_BIN serve --port $PORT --hostname 127.0.0.1 --print-logs
+ExecStartPost=/bin/bash -lc 'for i in {1..120}; do : > /dev/tcp/127.0.0.1/$PORT 2>/dev/null && exit 0; sleep 0.25; done; echo "opencode serve not listening on 127.0.0.1:$PORT after wait" >&2; exit 1'
 Restart=always
 RestartSec=5
 Environment=OPENCODE_DISABLE_AUTOUPDATE=true
