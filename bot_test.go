@@ -13,6 +13,37 @@ func TestFaNum(t *testing.T) {
 	}
 }
 
+func TestParseSessionNumber(t *testing.T) {
+	cases := map[string]int{"۳": 3, "12": 12, " ۱٢ ": 12, "۱۰": 10}
+	for in, want := range cases {
+		got, ok := parseSessionNumber(in)
+		if !ok || got != want {
+			t.Fatalf("parseSessionNumber(%q)=(%d,%v) want %d", in, got, ok, want)
+		}
+	}
+	for _, bad := range []string{"", "الف", "۲x", "-۱"} {
+		if _, ok := parseSessionNumber(bad); ok {
+			t.Fatalf("parseSessionNumber(%q) should fail", bad)
+		}
+	}
+}
+
+func TestParseSessionNumbers(t *testing.T) {
+	got := parseSessionNumbers("۱، ۳ و ۵")
+	want := []int{1, 3, 5}
+	if len(got) != len(want) {
+		t.Fatalf("got %v want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %v want %v", got, want)
+		}
+	}
+	if len(parseSessionNumbers("بدون عدد")) != 0 {
+		t.Fatal("expected no numbers")
+	}
+}
+
 func TestRenumberAutoLabels(t *testing.T) {
 	st := &UserState{
 		Sessions: []string{"a", "b", "c"},

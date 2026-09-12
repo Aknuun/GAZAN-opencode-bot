@@ -208,6 +208,17 @@ func (u *userStore) rename(userID int64, sid, label string) {
 	u.saver.MarkDirty()
 }
 
+// manualLabel نام دستیِ ثبت‌شدهٔ یک نشست را برمی‌گرداند (اگر کاربر با ✏️ عوض کرده باشد).
+func (u *userStore) manualLabel(userID int64, sid string) (string, bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	st := u.states[userID]
+	if st == nil || st.Manual == nil || !st.Manual[sid] {
+		return "", false
+	}
+	return st.Labels[sid], true
+}
+
 // remove نشست را از فهرست کاربر حذف می‌کند (بدون دست زدن به اجرا/سرور).
 func (u *userStore) remove(userID int64, sid string) {
 	u.mu.Lock()

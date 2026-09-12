@@ -18,6 +18,20 @@ type peakPending struct {
 	pid    string
 }
 
+// ssSel نشست‌های انتخاب‌شده برای یک عمل (حذف/ویرایش) را نگه می‌دارد.
+type ssSel struct {
+	action string
+	sids   []string
+}
+
+// ssPick حالت انتخابگرِ دکمه‌ای نشست‌ها را نگه می‌دارد: عملِ انتخابی، صفحهٔ
+// فعلی و شماره‌های تیک‌خورده.
+type ssPick struct {
+	action string
+	page   int
+	picked map[int]bool
+}
+
 // uiState داده‌های گذرای رابط کاربری (نه state ماندگار) هر چت را زیر قفل خودش
 // نگه می‌دارد: صفحهٔ مدل‌های باز، جست‌وجو، صفحهٔ «نشست‌ها»، حالت گروهی و کش هزینه.
 type uiState struct {
@@ -25,6 +39,9 @@ type uiState struct {
 	mlc  map[int64]modelsCtx
 	scx  map[int64]searchCtx
 	ssp  map[int64]int
+	ssl  map[int64][]string
+	ssx  map[int64]ssSel
+	spk  map[int64]ssPick
 	gsm  map[int64]bool
 	gsl  map[int64]map[string]bool
 	cost map[int64]costInfo
@@ -36,6 +53,9 @@ func newUIState() *uiState {
 		mlc:  map[int64]modelsCtx{},
 		scx:  map[int64]searchCtx{},
 		ssp:  map[int64]int{},
+		ssl:  map[int64][]string{},
+		ssx:  map[int64]ssSel{},
+		spk:  map[int64]ssPick{},
 		gsm:  map[int64]bool{},
 		gsl:  map[int64]map[string]bool{},
 		cost: map[int64]costInfo{},
@@ -101,6 +121,96 @@ func (u *uiState) ssPage(chatID int64) int {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return u.ssp[chatID]
+}
+
+// setSSList ترتیبِ نمایش‌داده‌شدهٔ نشست‌ها را نگه می‌دارد تا شماره‌ای که کاربر
+// بعداً می‌فرستد به همان نشست نگاشت شود.
+func (u *uiState) setSSList(chatID int64, ids []string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.ssl[chatID] = append([]string(nil), ids...)
+}
+
+func (u *uiState) ssList(chatID int64) []string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return append([]string(nil), u.ssl[chatID]...)
+}
+
+func (u *uiState) setSSSel(chatID int64, action string, sids []string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.ssx[chatID] = ssSel{action: action, sids: append([]string(nil), sids...)}
+}
+
+func (u *uiState) ssSel(chatID int64) (string, []string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	s := u.ssx[chatID]
+	return s.action, append([]string(nil), s.sids...)
+}
+
+func (u *uiState) clearSSSel(chatID int64) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	delete(u.ssx, chatID)
+}
+
+// ---------- انتخابگر دکمه‌ای نشست‌ها ----------
+
+func (u *uiState) startSSPick(chatID int64, action string, page int) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.spk[chatID] = ssPick{action: action, page: page, picked: map[int]bool{}}
+}
+
+func (u *uiState) ssPick(chatID int64) (string, int, map[int]bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	s := u.spk[chatID]
+	cp := make(map[int]bool, len(s.picked))
+	for k, v := range s.picked {
+		cp[k] = v
+	}
+	return s.action, s.page, cp
+}
+
+func (u *uiState) toggleSSPick(chatID int64, n int) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	s := u.spk[chatID]
+	if s.picked == nil {
+		s.picked = map[int]bool{}
+	}
+	if s.picked[n] {
+		delete(s.picked, n)
+	} else {
+		s.picked[n] = true
+	}
+	u.spk[chatID] = s
+}
+
+func (u *uiState) setSSPickAll(chatID int64, ns []int, val bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	s := u.spk[chatID]
+	if s.picked == nil {
+		s.picked = map[int]bool{}
+	}
+	for _, n := range ns {
+		if val {
+			s.picked[n] = true
+		} else {
+			delete(s.picked, n)
+		}
+	}
+	u.spk[chatID] = s
+}
+
+func (u *uiState) clearSSPick(chatID int64) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	delete(u.spk, chatID)
 }
 
 // ---------- حالت انتخاب گروهی ----------

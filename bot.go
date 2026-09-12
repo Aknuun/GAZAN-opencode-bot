@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"fmt"
+	"html"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -62,7 +64,7 @@ const helpText = `ربات کنترل opencode روی سرور
 اگر مدل در میانهٔ کار سؤالی بپرسد (مثل خود CLI)، همان پیام گزینه‌ها را دارد؛ با دکمه‌ها پاسخ بده تا اجرا ادامه یابد. ✏️ یعنی می‌توانی پاسخ خودت را تایپ کنی.`
 
 // botVersion نسخهٔ ربات است؛ هنگام انتشار نسخهٔ جدید آن را به‌روز کن
-const botVersion = "v8.11"
+const botVersion = "v8.12"
 
 const (
 	btnStatus    = "وضعیت و هزینه"
@@ -80,7 +82,7 @@ const (
 	// نمایش «🗂 نشست‌ها» مستقیماً از سرور opencode (نه فقط فهرست محلی ربات)
 	maxTrackedSessions = 80  // حداکثر نشستی که ربات در state نگه می‌دارد
 	sessionsFetchMax   = 300 // چند نشست اخیر سرور برای همگام‌سازی واکشی شود
-	sessionsPageSize   = 10  // هر صفحه از مدیر نشست‌ها چند نشست نشان دهد
+	sessionsPageSize   = 20  // هر صفحه از مدیر نشست‌ها چند نشست نشان دهد
 )
 
 // runCtl کنترل اجرای هم‌زمان یک نشست
@@ -156,6 +158,238 @@ func faNum(n int) string {
 // sessionLabel نام نمایشی نشست را برمی‌گرداند (نام دستی یا تاریخ آخرین فعالیت).
 func (b *Bot) sessionLabel(userID int64, sid string) string {
 	return b.users.sessionLabel(userID, sid)
+}
+
+// sessionTitle عنوان نمایشی نشست: نام دستی کاربر، وگرنه عنوان خودکار opencode
+// (خلاصهٔ مطالب نشست) و در نهایت برچسب تاریخ/شماره.
+func (b *Bot) sessionTitle(userID int64, sid string, titles map[string]string) string {
+	if l, ok := b.users.manualLabel(userID, sid); ok && l != "" {
+		return l
+	}
+	if t := strings.TrimSpace(titles[sid]); t != "" {
+		return clipHead(collapse(t), 90)
+	}
+	return b.sessionLabel(userID, sid)
+}
+
+// parseSessionNumber شمارهٔ نشست را از متن کاربر می‌خواند (ارقام فارسی/عربی/لاتین).
+func parseSessionNumber(s string) (int, bool) {
+	var digits []rune
+	for _, r := range strings.TrimSpace(s) {
+		switch {
+		case r >= '۰' && r <= '۹':
+			digits = append(digits, '0'+r-'۰')
+		case r >= '٠' && r <= '٩':
+			digits = append(digits, '0'+r-'٠')
+		case r >= '0' && r <= '9':
+			digits = append(digits, r)
+		case r == ' ' || r == '\u200c':
+			// فاصله/نیم‌فاصله نادیده گرفته می‌شود
+		default:
+			return 0, false
+		}
+	}
+	if len(digits) == 0 {
+		return 0, false
+	}
+	n, err := strconv.Atoi(string(digits))
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// parseSessionNumbers همهٔ شماره‌های داخل متن را می‌خواند (چند عدد با کاما/فاصله).
+func parseSessionNumbers(s string) []int {
+	var out []int
+	var cur []rune
+	flush := func() {
+		if len(cur) == 0 {
+			return
+		}
+		if n, err := strconv.Atoi(string(cur)); err == nil {
+			out = append(out, n)
+		}
+		cur = cur[:0]
+	}
+	for _, r := range s {
+		switch {
+		case r >= '۰' && r <= '۹':
+			cur = append(cur, '0'+r-'۰')
+		case r >= '٠' && r <= '٩':
+			cur = append(cur, '0'+r-'٠')
+		case r >= '0' && r <= '9':
+			cur = append(cur, r)
+		default:
+			flush()
+		}
+	}
+	flush()
+	return out
+}
+
+// sessionsBounds بازهٔ اندیس (۰-پایه، [start,end)) یک صفحه را می‌دهد.
+func sessionsBounds(page, total int) (int, int) {
+	start := page * sessionsPageSize
+	if start > total {
+		start = total
+	}
+	end := start + sessionsPageSize
+	if end > total {
+		end = total
+	}
+	return start, end
+}
+
+// sessionsPageBounds بازهٔ اندیس نشست‌های صفحهٔ فعلی است.
+func (b *Bot) sessionsPageBounds(chatID int64, total int) (int, int) {
+	return sessionsBounds(b.lastSSPage(chatID), total)
+}
+
+// pickNumbers شماره‌های صفحه (۱-پایه) را می‌دهد.
+func pickNumbers(start, end int) []int {
+	var ns []int
+	for n := start + 1; n <= end; n++ {
+		ns = append(ns, n)
+	}
+	return ns
+}
+
+// pickedSids شماره‌های تیک‌خورده را به شناسهٔ نشست تبدیل می‌کند (مرتب‌شده).
+func (b *Bot) pickedSids(chatID int64) []string {
+	_, _, picked := b.ui.ssPick(chatID)
+	list := b.ui.ssList(chatID)
+	nums := make([]int, 0, len(picked))
+	for n := range picked {
+		nums = append(nums, n)
+	}
+	sort.Ints(nums)
+	var sids []string
+	for _, n := range nums {
+		if n >= 1 && n <= len(list) {
+			sids = append(sids, list[n-1])
+		}
+	}
+	return sids
+}
+
+// renderSessionsPicker صفحهٔ انتخابِ دکمه‌ای شماره‌ها را نشان می‌دهد.
+func (b *Bot) renderSessionsPicker(chatID int64, msgID int) {
+	action, page, picked := b.ui.ssPick(chatID)
+	list := b.ui.ssList(chatID)
+	start, end := sessionsBounds(page, len(list))
+
+	var title string
+	switch action {
+	case "del":
+		title = "🗑 کدام نشست‌ها حذف شوند؟"
+	case "rn":
+		title = "✏️ نام کدام نشست‌ها عوض شود؟"
+	case "view":
+		title = "👁 کدام نشست‌ها نمایش داده شوند؟"
+	default:
+		title = "🔀 عملیات گروهی"
+	}
+	var sb strings.Builder
+	sb.WriteString(title + "\n")
+	if end <= start {
+		sb.WriteString("نشستی در این صفحه نیست.")
+	} else {
+		fmt.Fprintf(&sb, "روی شماره‌ها بزن تا تیک بخورند (صفحه: %s تا %s).", faNum(start+1), faNum(end))
+	}
+
+	var rows [][]tgbotapi.InlineKeyboardButton
+	var row []tgbotapi.InlineKeyboardButton
+	for n := start + 1; n <= end; n++ {
+		label := faNum(n)
+		if picked[n] {
+			label = "✅" + faNum(n)
+		}
+		row = append(row, inlineBtn(label, "ss:tgl:"+strconv.Itoa(n)))
+		if len(row) == 5 {
+			rows = append(rows, row)
+			row = nil
+		}
+	}
+	if len(row) > 0 {
+		rows = append(rows, row)
+	}
+	rows = append(rows, []tgbotapi.InlineKeyboardButton{
+		inlineBtn("☑️ انتخاب همه", "ss:allsel:all"),
+		inlineBtn("🔲 لغو انتخاب", "ss:none:all"),
+	})
+	if action == "" {
+		rows = append(rows, []tgbotapi.InlineKeyboardButton{
+			inlineBtn("🗑 حذف انتخاب‌شده‌ها", "ss:go:del"),
+			inlineBtn("✏️ تغییر نام انتخاب‌شده‌ها", "ss:go:rn"),
+		})
+	} else {
+		rows = append(rows, []tgbotapi.InlineKeyboardButton{inlineBtn("▶️ تأیید", "ss:ok:all")})
+	}
+	rows = append(rows, []tgbotapi.InlineKeyboardButton{inlineBtn("🔙 بازگشت", "ss:refresh")})
+
+	edit := tgbotapi.NewEditMessageText(chatID, msgID, sb.String())
+	edit.ReplyMarkup = rowsOf(rows...)
+	b.api.Send(edit)
+}
+
+// applySessionsAction عمل انتخاب‌شده را روی نشست‌های داده‌شده اجرا می‌کند.
+func (b *Bot) applySessionsAction(userID, chatID int64, msgID int, action string, sids []string) {
+	if len(sids) == 0 {
+		b.send(chatID, "نشستی انتخاب نشد.")
+		return
+	}
+	switch action {
+	case "view":
+		if len(sids) == 1 {
+			b.useSession(userID, chatID, sids[0])
+			return
+		}
+		for _, sid := range sids {
+			head := "👁 " + b.sessionLabel(userID, sid) + "\n\n"
+			b.sendChunks(chatID, head+b.sessionTopicsText(sid), 0)
+		}
+	case "rn":
+		b.ui.setSSSel(chatID, "rn", sids)
+		b.setPendingByChat(chatID, "ssrn")
+		prompt := "✏️ نام جدید را برای " + faNum(len(sids)) + " نشست انتخاب‌شده بفرست:"
+		if len(sids) == 1 {
+			prompt = "✏️ نام جدید نشست «" + b.sessionLabel(userID, sids[0]) + "» را بفرست:"
+		}
+		if msgID != 0 {
+			b.edit(chatID, msgID, prompt)
+		} else {
+			b.send(chatID, prompt)
+		}
+	case "del":
+		b.ui.setSSSel(chatID, "del", sids)
+		var names []string
+		for i, sid := range sids {
+			if i >= 10 {
+				names = append(names, "…")
+				break
+			}
+			names = append(names, "• "+html.EscapeString(b.sessionLabel(userID, sid)))
+		}
+		text := fmt.Sprintf("🗑 <b>%s نشست</b> برای همیشه حذف شوند؟\nاین نشست‌ها و تمام گفتگویشان از روی سرور opencode پاک می‌شود (غیرقابل بازگشت).\n\n%s", faNum(len(sids)), strings.Join(names, "\n"))
+		kb := rowsOf(
+			[]tgbotapi.InlineKeyboardButton{inlineBtn("🗑 بله، همه را حذف کن", "ss:delc:all")},
+			[]tgbotapi.InlineKeyboardButton{inlineBtn("انصراف", "ss:refresh")},
+		)
+		if msgID != 0 {
+			edit := tgbotapi.NewEditMessageText(chatID, msgID, text)
+			edit.ParseMode = "HTML"
+			edit.ReplyMarkup = kb
+			b.api.Send(edit)
+		} else {
+			msg := tgbotapi.NewMessage(chatID, text)
+			msg.ParseMode = "HTML"
+			msg.ReplyMarkup = kb
+			b.api.Send(msg)
+		}
+	default:
+		b.send(chatID, "عملیات نامشخص.")
+	}
 }
 
 func (b *Bot) stateFor(userID, chatID int64) *UserState {
@@ -1280,6 +1514,15 @@ func (b *Bot) sessionsPage(userID, chatID int64, msgID, page int) {
 
 	ids, active := b.users.snapshotSessions(userID)
 
+	titles := make(map[string]string, len(list))
+	for _, s := range list {
+		if t := strings.TrimSpace(s.Title); t != "" {
+			titles[s.ID] = t
+		}
+	}
+	// ترتیب نمایش را نگه می‌داریم تا شمارهٔ بعدیِ کاربر به همان نشست نگاشت شود
+	b.ui.setSSList(chatID, ids)
+
 	if len(ids) == 0 {
 		text := "🗂 <b>نشست‌ها</b>\n\n"
 		if warn != nil {
@@ -1321,14 +1564,6 @@ func (b *Bot) sessionsPage(userID, chatID int64, msgID, page int) {
 	if pages > 1 {
 		fmt.Fprintf(&sb, "  (صفحه %s از %s)", faNum(page+1), faNum(pages))
 	}
-	group := b.groupMode(chatID)
-	if group {
-		if n := b.groupSelCount(chatID); n > 0 {
-			fmt.Fprintf(&sb, "  — 🔀 %s نشست انتخاب شده", faNum(n))
-		} else {
-			sb.WriteString("  — 🔀 حالت انتخاب گروهی")
-		}
-	}
 	sb.WriteString("\n")
 	if warn != nil {
 		sb.WriteString("⚠️ سرور در دسترس نبود؛ نشست‌های ذخیره‌شده نمایش داده می‌شود.\n")
@@ -1336,11 +1571,7 @@ func (b *Bot) sessionsPage(userID, chatID int64, msgID, page int) {
 	for i := start; i < end; i++ {
 		sid := ids[i]
 		_, running := b.runFor(sid)
-		name := b.sessionLabel(userID, sid)
-		line := fmt.Sprintf("<b>%s</b>  `%s`", name, shortSID(sid))
-		if group && b.groupSel(chatID, sid) {
-			line = "☑️ " + line
-		}
+		line := fmt.Sprintf("%s. %s", faNum(i+1), html.EscapeString(b.sessionTitle(userID, sid, titles)))
 		if sid == active {
 			line += "  ← فعال"
 		}
@@ -1349,36 +1580,15 @@ func (b *Bot) sessionsPage(userID, chatID int64, msgID, page int) {
 		}
 		sb.WriteString(line + "\n")
 	}
-	if group {
-		sb.WriteString("\nروی هر نشست بزن تا انتخاب/لغو شود، بعد «🗑 حذف انتخاب‌ها» را بزن.")
-	} else {
-		sb.WriteString("\nبرای دیدن جزئیات و تغییر نام، روی نام نشست بزن. 🗑 حذف، نشست را روی سرور هم برای همیشه پاک می‌کند.")
-	}
+	sb.WriteString("\nبرای حذف/ویرایش/مشاهده، دکمهٔ مربوط را بزن و بعد عدد نشست را بفرست.")
 
 	var rows [][]tgbotapi.InlineKeyboardButton
-	for i := start; i < end; i++ {
-		sid := ids[i]
-		label := b.sessionLabel(userID, sid)
-		if group {
-			mark := "☑️"
-			if b.groupSel(chatID, sid) {
-				mark = "✅"
-			}
-			rows = append(rows, []tgbotapi.InlineKeyboardButton{inlineBtn(mark+" "+clipHead(label, 24), "ss:gtgl:"+sid)})
-			continue
-		}
-		// دکمهٔ درازِ نام نشست (باز کردن جزئیات)؛ اگر فعال است تیک می‌خورد
-		mark := ""
-		if sid == active {
-			mark = "✓ "
-		}
-		row := []tgbotapi.InlineKeyboardButton{inlineBtn(mark+clipHead(label, 26), "ss:use:"+sid)}
-		if _, running := b.runFor(sid); running {
-			row = append(row, inlineBtn("⏹", "ss:stop:"+sid))
-		}
-		row = append(row, inlineBtn("🗑", "ss:del:"+sid))
-		rows = append(rows, row)
-	}
+	rows = append(rows, []tgbotapi.InlineKeyboardButton{
+		inlineBtn("🗑 حذف", "ss:pick:del"),
+		inlineBtn("✏️ ویرایش", "ss:pick:rn"),
+		inlineBtn("👁 مشاهده", "ss:pick:view"),
+	})
+	rows = append(rows, []tgbotapi.InlineKeyboardButton{inlineBtn("🔀 عملیات گروهی", "ss:pick:grp")})
 	if pages > 1 {
 		nav := []tgbotapi.InlineKeyboardButton{}
 		if page > 0 {
@@ -1394,21 +1604,9 @@ func (b *Bot) sessionsPage(userID, chatID int64, msgID, page int) {
 		}
 		rows = append(rows, nav)
 	}
-	if group {
-		del := "🗑 حذف انتخاب‌ها"
-		if n := b.groupSelCount(chatID); n > 0 {
-			del = "🗑 حذف انتخاب‌ها (" + faNum(n) + ")"
-		}
-		rows = append(rows, []tgbotapi.InlineKeyboardButton{inlineBtn(del, "ss:gdel"), inlineBtn("✖️ لغو حالت گروهی", "ss:gcncl")})
-	}
 	rows = append(rows,
 		[]tgbotapi.InlineKeyboardButton{inlineBtn("➕ نشست جدید", "ss:new"), inlineBtn("🔄 تازه‌سازی", "ss:refresh"), inlineBtn("❌ بستن", "ss:close")},
 	)
-	if !group {
-		rows = append(rows,
-			[]tgbotapi.InlineKeyboardButton{inlineBtn("🔀 عملیات گروهی", "ss:gm")},
-		)
-	}
 
 	kb := rowsOf(rows...)
 	if msgID == 0 {
@@ -1427,6 +1625,8 @@ func (b *Bot) sessionsPage(userID, chatID int64, msgID, page int) {
 func (b *Bot) onSessionsCallback(userID, chatID int64, msgID int, data string) {
 	switch data {
 	case "ss:refresh":
+		b.ui.clearSSSel(chatID)
+		b.ui.clearSSPick(chatID)
 		b.sessionsAtSamePage(userID, chatID, msgID)
 	case "ss:close":
 		edit := tgbotapi.NewEditMessageText(chatID, msgID, "بسته شد.")
@@ -1463,6 +1663,46 @@ func (b *Bot) onSessionsCallback(userID, chatID int64, msgID int, data string) {
 			if p, err := strconv.Atoi(parts[2]); err == nil {
 				b.sessionsPage(userID, chatID, msgID, p)
 			}
+		case "pick":
+			// باز کردن انتخابگر دکمه‌ای؛ grp یعنی حالت گروهی بدون عملِ پیش‌فرض
+			act := parts[2]
+			if act == "grp" {
+				act = ""
+			}
+			b.ui.startSSPick(chatID, act, b.lastSSPage(chatID))
+			b.renderSessionsPicker(chatID, msgID)
+		case "tgl":
+			if n, err := strconv.Atoi(parts[2]); err == nil {
+				b.ui.toggleSSPick(chatID, n)
+				b.renderSessionsPicker(chatID, msgID)
+			}
+		case "allsel":
+			_, page, _ := b.ui.ssPick(chatID)
+			start, end := sessionsBounds(page, len(b.ui.ssList(chatID)))
+			b.ui.setSSPickAll(chatID, pickNumbers(start, end), true)
+			b.renderSessionsPicker(chatID, msgID)
+		case "none":
+			_, page, _ := b.ui.ssPick(chatID)
+			start, end := sessionsBounds(page, len(b.ui.ssList(chatID)))
+			b.ui.setSSPickAll(chatID, pickNumbers(start, end), false)
+			b.renderSessionsPicker(chatID, msgID)
+		case "ok":
+			act, _, _ := b.ui.ssPick(chatID)
+			sids := b.pickedSids(chatID)
+			if len(sids) == 0 {
+				b.send(chatID, "هیچ نشستی انتخاب نشده؛ اول شماره‌ها را بزن.")
+				return
+			}
+			b.ui.clearSSPick(chatID)
+			b.applySessionsAction(userID, chatID, msgID, act, sids)
+		case "go":
+			sids := b.pickedSids(chatID)
+			if len(sids) == 0 {
+				b.send(chatID, "هیچ نشستی انتخاب نشده؛ اول شماره‌ها را بزن.")
+				return
+			}
+			b.ui.clearSSPick(chatID)
+			b.applySessionsAction(userID, chatID, msgID, parts[2], sids)
 		case "use":
 			sid := parts[2]
 			b.useSession(userID, chatID, sid)
@@ -1481,19 +1721,13 @@ func (b *Bot) onSessionsCallback(userID, chatID int64, msgID int, data string) {
 			)
 			b.api.Send(edit)
 		case "delc":
-			sid := parts[2]
-			b.stopRun(sid)
-			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-			err := b.oc.DeleteSession(ctx, sid)
-			cancel()
-			if err != nil {
-				b.send(chatID, "❌ حذف نشست روی سرور ممکن نشد: "+err.Error())
-				b.sessionsAtSamePage(userID, chatID, msgID)
-				return
+			var sids []string
+			if parts[2] == "all" {
+				_, sids = b.ui.ssSel(chatID)
+			} else {
+				sids = []string{parts[2]}
 			}
-			b.deleteSession(userID, sid)
-			b.send(chatID, "🗑 نشست از روی سرور حذف شد.")
-			b.sessionsAtSamePage(userID, chatID, msgID)
+			b.deleteSessionsBySids(userID, chatID, msgID, sids)
 		case "gtgl":
 			b.toggleGroupSel(chatID, parts[2])
 			b.sessionsAtSamePage(userID, chatID, msgID)
@@ -1564,6 +1798,45 @@ func (b *Bot) deleteGroupSessions(userID, chatID int64, msgID int) {
 		ok++
 	}
 	text := fmt.Sprintf("🗑 حذف گروهی انجام شد: %s نشست حذف شد.", faNum(ok))
+	if fail > 0 {
+		text += fmt.Sprintf("\n⚠️ %s نشست حذف نشد.", faNum(fail))
+		if len(errMsg) > 0 {
+			text += "\n" + strings.Join(errMsg, "\n")
+		}
+	}
+	b.send(chatID, text)
+	b.sessionsPage(userID, chatID, msgID, 0)
+}
+
+// deleteSessionsBySids نشست‌های داده‌شده را یک‌به‌یک روی سرور حذف می‌کند و
+// نتیجه را گزارش می‌دهد.
+func (b *Bot) deleteSessionsBySids(userID, chatID int64, msgID int, sids []string) {
+	b.ui.clearSSSel(chatID)
+	if len(sids) == 0 {
+		b.sessionsAtSamePage(userID, chatID, msgID)
+		return
+	}
+	if msgID != 0 {
+		b.edit(chatID, msgID, "در حال حذف "+faNum(len(sids))+" نشست…")
+	}
+	ok, fail := 0, 0
+	var errMsg []string
+	for _, sid := range sids {
+		b.stopRun(sid)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		err := b.oc.DeleteSession(ctx, sid)
+		cancel()
+		if err != nil {
+			fail++
+			if len(errMsg) < 3 {
+				errMsg = append(errMsg, "• "+shortSID(sid)+": "+err.Error())
+			}
+			continue
+		}
+		b.deleteSession(userID, sid)
+		ok++
+	}
+	text := fmt.Sprintf("🗑 %s نشست حذف شد.", faNum(ok))
 	if fail > 0 {
 		text += fmt.Sprintf("\n⚠️ %s نشست حذف نشد.", faNum(fail))
 		if len(errMsg) > 0 {

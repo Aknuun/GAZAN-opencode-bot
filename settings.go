@@ -360,7 +360,9 @@ func (b *Bot) clearPending(userID int64) {
 func (b *Bot) handlePending(userID, chatID int64, pending, text string) {
 	text = strings.TrimSpace(text)
 	env := b.envFor()
-	defer b.clearPending(userID)
+	// ابتدا pending پاک می‌شود تا شاخه‌هایی که یک pending تازه می‌سازند (مثل
+	// جست‌وجو یا ادامهٔ ویرایش نشست) با defer پاک نشوند.
+	b.clearPending(userID)
 	parts := strings.SplitN(pending, ":", 2)
 	kind := parts[0]
 	arg := ""
@@ -385,6 +387,18 @@ func (b *Bot) handlePending(userID, chatID int64, pending, text string) {
 		}
 		b.setSessionLabel(userID, sid, text)
 		b.send(chatID, "✅ نام نشست عوض شد:\n"+text)
+	case "ssrn":
+		// نام جدید برای نشست‌های انتخاب‌شده (ویرایش گروهی) رسید
+		_, sids := b.ui.ssSel(chatID)
+		if len(sids) == 0 {
+			b.send(chatID, "نشستی انتخاب نشده بود؛ دوباره از دکمهٔ «نشست‌ها» شروع کن.")
+			return
+		}
+		for _, sid := range sids {
+			b.setSessionLabel(userID, sid, text)
+		}
+		b.ui.clearSSSel(chatID)
+		b.send(chatID, fmt.Sprintf("✅ نام %s نشست عوض شد:\n%s", faNum(len(sids)), text))
 	case "model":
 		full := text
 		if !strings.Contains(full, "/") {

@@ -23,10 +23,17 @@ type qEvent struct {
 
 const (
 	qEvTap    = iota // زدن روی یک گزینه
-	qEvOK            // تأیید (چندگزینهای یا بدون انتخاب)
-	qEvText          // پاسخ آزاد تایپشده
+	qEvOK            // تأیید (چندگزینه‌ای یا بدون انتخاب)
+	qEvText          // پاسخ آزاد تایپ‌شده
 	qEvCustom        // درخواست «نوشتن پاسخ خودم»
 	qEvCancel        // رد سؤال و ادامه
+)
+
+const (
+	// autoSelectDelay مهلت انتخاب خودکار گزینهٔ پیشنهادی در سؤال‌های تک‌گزینه‌ای
+	autoSelectDelay = 50 * time.Second
+	// autoTickEvery فاصلهٔ به‌روزرسانی شمارش معکوس روی پیام
+	autoTickEvery = 5 * time.Second
 )
 
 // pendingQ یک سؤالِ در انتظارِ پاسخ؛ صاحب آن گوروتین poll است و همهٔ
@@ -42,6 +49,10 @@ type pendingQ struct {
 	idx    int        // سؤالِ در حال پاسخ (از 0)
 	mode   string     // "choice" | "text"
 	ev     chan qEvent
+
+	autoIdx int       // گزینهٔ پیشنهادی برای انتخاب خودکار (-1 = ندارد)
+	autoAt  time.Time // مهلت انتخاب خودکار برای سؤالِ فعلی
+	autoKey string    // کلید سؤالِ فعلی برای تشخیص تغییر سؤال
 }
 
 // qReg ثبت سؤال‌های تعاملی در انتظار پاسخ؛ توکن کوتاه → pendingQ.
@@ -160,6 +171,16 @@ func (b *Bot) answerQuestion(ctx context.Context, r *runCtl, progressMsg int, pa
 
 	b.renderQ(p, partial)
 	for {
+		b.armAuto(p)
+		var timeout, tick <-chan time.Time
+		if p.autoIdx >= 0 {
+			rem := time.Until(p.autoAt)
+			if rem < 0 {
+				rem = 0
+			}
+			timeout = time.After(rem)
+			tick = time.After(autoTickEvery)
+		}
 		select {
 		case <-ctx.Done():
 			return true
@@ -167,8 +188,54 @@ func (b *Bot) answerQuestion(ctx context.Context, r *runCtl, progressMsg int, pa
 			if b.qStep(ctx, p, ev) {
 				return false
 			}
+		case <-tick:
+			b.renderQ(p, "")
+		case <-timeout:
+			if p.autoIdx >= 0 {
+				opt := p.autoIdx
+				p.autoIdx = -1
+				if b.qStep(ctx, p, qEvent{kind: qEvTap, opt: opt}) {
+					return false
+				}
+			}
 		}
 	}
+}
+
+// armAuto اگر سؤالِ فعلی تک‌گزینه‌ای باشد، شمارش معکوس انتخاب خودکار گزینهٔ
+// پیشنهادی را فعال می‌کند. با تغییر سؤال، مهلت از نو تنظیم می‌شود.
+func (b *Bot) armAuto(p *pendingQ) {
+	key := fmt.Sprintf("%d:%s", p.idx, p.mode)
+	if key == p.autoKey {
+		return
+	}
+	p.autoKey = key
+	p.autoIdx = -1
+	p.autoAt = time.Time{}
+	if p.mode != "choice" || p.idx < 0 || p.idx >= len(p.info) {
+		return
+	}
+	q := p.info[p.idx]
+	if q.Multiple || len(q.Options) == 0 {
+		return
+	}
+	p.autoIdx = suggestedOptionIndex(q)
+	p.autoAt = time.Now().Add(autoSelectDelay)
+}
+
+// suggestedOptionIndex گزینهٔ پیشنهادی سؤال را برمی‌گرداند: اولین گزینه‌ای که
+// برچسبش «پیشنهاد»/«recommend» دارد؛ وگرنه گزینهٔ اول.
+func suggestedOptionIndex(q occlient.QuestionInfo) int {
+	for i, o := range q.Options {
+		l := strings.ToLower(o.Label)
+		if strings.Contains(l, "پیشنهاد") || strings.Contains(l, "recommend") {
+			return i
+		}
+	}
+	if len(q.Options) > 0 {
+		return 0
+	}
+	return -1
 }
 
 // waitQuestionReq درخواست سؤالِ متعلق به همین پیام/نشست را پیدا میکند.
@@ -208,6 +275,7 @@ func (b *Bot) renderQ(p *pendingQ, partial string) {
 	if p.idx < 0 || p.idx >= len(p.info) {
 		return
 	}
+	b.armAuto(p)
 	q := p.info[p.idx]
 	var sb strings.Builder
 	sb.WriteString("🤔 ")
@@ -228,6 +296,14 @@ func (b *Bot) renderQ(p *pendingQ, partial string) {
 		sb.WriteString("\n(چندگزینهای؛ گزینهها را بزن و بعد «✔️ تأیید» کن)")
 	case len(q.Options) > 1:
 		sb.WriteString("\n(یکی از گزینهها را انتخاب کن)")
+	}
+	if p.autoIdx >= 0 && !p.autoAt.IsZero() && p.autoIdx < len(q.Options) {
+		rem := int(time.Until(p.autoAt).Seconds())
+		if rem < 0 {
+			rem = 0
+		}
+		fmt.Fprintf(&sb, "\n\n⏱ اگر تا %s ثانیه انتخابی نکنی، «%s» خودکار انتخاب میشود.",
+			faNum(rem), clipHead(q.Options[p.autoIdx].Label, 40))
 	}
 	for _, o := range q.Options {
 		sb.WriteString("\n\n")
