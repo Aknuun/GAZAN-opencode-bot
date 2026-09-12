@@ -89,3 +89,42 @@ func TestActiveProviderUsesSessionModel(t *testing.T) {
 		t.Fatalf("activeProvider(no session) = %q; want empty", got)
 	}
 }
+
+func TestActiveProviderPrefersProviderID(t *testing.T) {
+	b, _ := testBot(t, 1)
+	oc := b.oc.(*fakeOC)
+	// سرور فقط شناسهٔ مدل را می‌دهد (بدون اسلش) اما providerID درست است.
+	s := &occlient.Session{ID: "ses_1", ModelID: "deepseek-flash"}
+	s.Model.ID = "deepseek-flash"
+	s.Model.ProviderID = "deepseek"
+	oc.session = s
+
+	b.stateFor(1, 10)
+	b.setSession(1, "ses_1")
+	if got := b.activeProvider(1); got != "deepseek" {
+		t.Fatalf("activeProvider = %q; want deepseek (from providerID)", got)
+	}
+}
+
+func TestStatusTextSilentWhenUnknown(t *testing.T) {
+	p := newPeakStore(filepath.Join(t.TempDir(), "peakhours.json"))
+	if err := p.load(); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	defer p.close()
+	if got := p.statusText("some-unknown-provider", time.Now()); got != "" {
+		t.Fatalf("unknown provider should print nothing, got %q", got)
+	}
+	// پروایدر شناخته‌شده باید ثبت و نمایش داده شود.
+	if got := p.statusText("deepseek", time.Now()); got == "" {
+		t.Fatalf("deepseek status should not be empty")
+	}
+}
+
+func TestProviderForModelFallsBackToCatalog(t *testing.T) {
+	b, _ := testBot(t, 1)
+	b.cat.parseOpencode([]byte(`{"all":[{"id":"deepseek","name":"DeepSeek","models":{"deepseek-flash":{"name":"DeepSeek Flash"}}}]}`))
+	if got := b.providerFor("", "deepseek-flash"); got != "deepseek" {
+		t.Fatalf("providerFor = %q; want deepseek (from catalog)", got)
+	}
+}

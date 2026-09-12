@@ -62,7 +62,7 @@ const helpText = `ربات کنترل opencode روی سرور
 اگر مدل در میانهٔ کار سؤالی بپرسد (مثل خود CLI)، همان پیام گزینه‌ها را دارد؛ با دکمه‌ها پاسخ بده تا اجرا ادامه یابد. ✏️ یعنی می‌توانی پاسخ خودت را تایپ کنی.`
 
 // botVersion نسخهٔ ربات است؛ هنگام انتشار نسخهٔ جدید آن را به‌روز کن
-const botVersion = "v8.9"
+const botVersion = "v8.10"
 
 const (
 	btnStatus    = "وضعیت و هزینه"
@@ -683,18 +683,20 @@ const (
 	outcomeError                     // قطع ارتباط / بی‌پاسخی / خطای دیگر
 )
 
-// pollResult خروجی حلقهٔ poll: متن نهایی + نتیجه + مدلِ استفاده‌شده.
+// pollResult خروجی حلقهٔ poll: متن نهایی + نتیجه + مدل/پروایدرِ استفاده‌شده.
 type pollResult struct {
-	outcome runOutcome
-	text    string
-	model   string
+	outcome  runOutcome
+	text     string
+	model    string
+	provider string
 }
 
 // usage آمار لحظه‌ای مصرف یک نشست.
 type usage struct {
-	in, out int
-	cost    float64
-	model   string
+	in, out  int
+	cost     float64
+	model    string
+	provider string
 }
 
 func (b *Bot) submitPrompt(userID, chatID int64, prompt string) {
@@ -725,11 +727,34 @@ func (b *Bot) activeProvider(userID int64) string {
 	if st := b.stateOf(userID); st != nil && st.SessionID != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if s, err := b.oc.GetSession(ctx, st.SessionID); err == nil && s != nil && s.ModelID != "" {
-			return providerOf(s.ModelID)
+		if s, err := b.oc.GetSession(ctx, st.SessionID); err == nil && s != nil {
+			if pid := b.providerFor(s.Model.ProviderID, s.Model.ID); pid != "" {
+				return pid
+			}
+			if pid := b.providerFor("", s.ModelID); pid != "" {
+				return pid
+			}
 		}
 	}
-	return providerOf(b.envFor().currentModel())
+	return b.providerFor("", b.envFor().currentModel())
+}
+
+// providerFor پروایدر را تعیین می‌کند: اول providerID واقعیِ opencode، بعد بخش
+// پروایدر مدل (اگر «provider/model» باشد)، و در نهایت تطبیق مدل با کاتالوگ.
+func (b *Bot) providerFor(providerID, model string) string {
+	if p := strings.TrimSpace(providerID); p != "" {
+		return normalizeProvider(p)
+	}
+	if model == "" {
+		return ""
+	}
+	if i := strings.IndexByte(model, '/'); i > 0 {
+		return normalizeProvider(model[:i])
+	}
+	if p, ok := b.cat.providerOfModel(model); ok {
+		return normalizeProvider(p)
+	}
+	return normalizeProvider(model)
 }
 
 // maybeAskPeak اگر پروایدر مدل فعال در بازهٔ پیک باشد، پیام تأیید با دو دکمه
@@ -901,7 +926,17 @@ func (b *Bot) sessionUsage(sid string) (usage, bool) {
 	if err != nil || s == nil {
 		return usage{}, false
 	}
-	return usage{in: s.Tokens.Input, out: s.Tokens.Output, cost: s.Cost, model: s.ModelID}, true
+	model := s.Model.ID
+	if model == "" {
+		model = s.ModelID
+	}
+	return usage{
+		in:       s.Tokens.Input,
+		out:      s.Tokens.Output,
+		cost:     s.Cost,
+		model:    model,
+		provider: s.Model.ProviderID,
+	}, true
 }
 
 // sendRunSummary بعد از پایان هر اجرا یک پیام جدا زیر پاسخ می‌فرستد با نتیجه،
@@ -933,8 +968,15 @@ func (b *Bot) sendRunSummary(r *runCtl, res pollResult, pre usage, preOK bool) {
 	}
 
 	model := res.model
+	provider := res.provider
 	if model == "" && curOK {
 		model = cur.model
+	}
+	if provider == "" && curOK {
+		provider = cur.provider
+	}
+	if provider == "" {
+		provider = b.providerFor("", model)
 	}
 
 	var sb strings.Builder
@@ -958,10 +1000,10 @@ func (b *Bot) sendRunSummary(r *runCtl, res pollResult, pre usage, preOK bool) {
 	} else {
 		sb.WriteString("💵 آمار هزینه در دسترس نبود\n")
 	}
-	// اطلاعات پیک مصرف پروایدرِ همین مکالمه
-	if pid := providerOf(model); pid != "" {
+	// اطلاعات پیک مصرف پروایدرِ همین مکالمه (ثبت + نمایش وضعیت)
+	if status := b.peaks.statusText(provider, time.Now()); status != "" {
 		sb.WriteString("━━━━━━━━━━━━━━━━\n")
-		sb.WriteString(b.peaks.statusText(pid, time.Now()))
+		sb.WriteString(status)
 	}
 	b.sendSummaryWithDelete(r.ChatID, sb.String(), r.SID)
 }
@@ -997,6 +1039,7 @@ func (b *Bot) poll(ctx context.Context, r *runCtl, progressMsg int, startModel s
 	lastSig := ""
 	lastChange := time.Now()
 	model := startModel
+	provider := ""
 	for {
 		select {
 		case <-ctx.Done():
@@ -1006,7 +1049,7 @@ func (b *Bot) poll(ctx context.Context, r *runCtl, progressMsg int, startModel s
 			if err != nil {
 				errCount++
 				if errCount > 5 {
-					return pollResult{outcome: outcomeError, text: "⚠️ ارتباط با opencode قطع شد: " + err.Error(), model: model}
+					return pollResult{outcome: outcomeError, text: "⚠️ ارتباط با opencode قطع شد: " + err.Error(), model: model, provider: provider}
 				}
 				continue
 			}
@@ -1018,17 +1061,20 @@ func (b *Bot) poll(ctx context.Context, r *runCtl, progressMsg int, startModel s
 				if msg.Info.ModelID != "" {
 					model = msg.Info.ModelID
 				}
+				if msg.Info.ProviderID != "" {
+					provider = msg.Info.ProviderID
+				}
 				curText = joinText(msg)
 				act = activityLabel(msg)
 				if isFinalFinish(msg.Info.Finish) {
 					if curText == "" {
 						curText = "⚠️ پاسخی دریافت نشد."
 					}
-					return pollResult{outcome: outcomeDone, text: curText, model: model}
+					return pollResult{outcome: outcomeDone, text: curText, model: model, provider: provider}
 				}
 				if hasPendingQuestion(msg) {
 					if b.answerQuestion(ctx, r, progressMsg, curText, msg.Info.ID) {
-						return pollResult{outcome: outcomeStopped, text: "⛔ متوقف شد.", model: model}
+						return pollResult{outcome: outcomeStopped, text: "⛔ متوقف شد.", model: model, provider: provider}
 					}
 					// بعد از پاسخ به سؤال، وضعیت زنده را از نو نشان بده
 					lastShown = ""
@@ -1046,7 +1092,7 @@ func (b *Bot) poll(ctx context.Context, r *runCtl, progressMsg int, startModel s
 				lastSig = sig
 				lastChange = now
 			} else if now.Sub(lastChange) >= pollQuietLimit {
-				return pollResult{outcome: outcomeError, text: "⚠️ بیش از " + pollQuietLimit.String() + " است که مدل هیچ پاسخ یا فعالیتی تولید نکرده؛ احتمالاً پروایدر مشکل دارد.\nبا /new یک نشست تازه بساز یا مدل را در ⚙️ تنظیمات عوض کن.", model: model}
+				return pollResult{outcome: outcomeError, text: "⚠️ بیش از " + pollQuietLimit.String() + " است که مدل هیچ پاسخ یا فعالیتی تولید نکرده؛ احتمالاً پروایدر مشکل دارد.\nبا /new یک نشست تازه بساز یا مدل را در ⚙️ تنظیمات عوض کن.", model: model, provider: provider}
 			}
 
 			interval := 900 * time.Millisecond

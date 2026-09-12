@@ -134,6 +134,32 @@ func (p *peakStore) enabledFor(pid string) bool {
 	return ok
 }
 
+// ensure بازه‌های پیک داخلیِ یک پروایدر را (اگر ثبت نشده باشد) ثبت و فعال
+// می‌کند تا در پایان هر چت، ساعت پیک شناخته‌شده‌اش «ثبت» شود.
+func (p *peakStore) ensure(pid string) {
+	def, ok := builtinPeaks[pid]
+	if !ok {
+		return
+	}
+	p.mu.Lock()
+	if p.cfg == nil {
+		p.cfg = map[string]*peakProvider{}
+	}
+	changed := false
+	if cur, ok := p.cfg[pid]; !ok {
+		p.cfg[pid] = &peakProvider{Windows: append([]peakWindow(nil), def...), Enabled: true, Source: "builtin"}
+		changed = true
+	} else if len(cur.Windows) == 0 {
+		cur.Windows = append([]peakWindow(nil), def...)
+		cur.Source = "builtin"
+		changed = true
+	}
+	p.mu.Unlock()
+	if changed {
+		p.saver.MarkDirty()
+	}
+}
+
 // enable فعال‌کردن یادآوری با بازه‌های مشخص
 func (p *peakStore) enable(pid string, ws []peakWindow) {
 	p.mu.Lock()
@@ -292,10 +318,16 @@ func peakPromptText(pid string, endMin int) string {
 
 // statusText خلاصهٔ وضعیت پیکِ پروایدر را برای پایان هر چت می‌سازد.
 func (p *peakStore) statusText(pid string, now time.Time) string {
+	if pid == "" {
+		return ""
+	}
+	// اگر پروایدرِ شناخته‌شده‌ای باشد ولی هنوز ثبت نشده، همین‌جا ثبتش کن.
+	p.ensure(pid)
 	name := peakProviderName(pid)
 	ws := p.windowsFor(pid)
 	if len(ws) == 0 {
-		return "⏰ ساعت پیک «" + name + "» ثبت نشده است."
+		// ناشناس: هیچ ادعایی نکن و چیزی نشان نده.
+		return ""
 	}
 	if !p.enabledFor(pid) {
 		return "⏰ یادآوری ساعت پیک «" + name + "» خاموش است."
@@ -307,10 +339,19 @@ func (p *peakStore) statusText(pid string, now time.Time) string {
 	return base + "\n🟢 الان خارج از ساعات پیک هستیم."
 }
 
-// providerOf بخش پروایدر یک مدل «provider/model» را برمی‌گرداند.
-func providerOf(model string) string {
-	if i := strings.IndexByte(model, '/'); i > 0 {
-		return model[:i]
+// normalizeProvider شناسهٔ پروایدر را یکسان‌سازی می‌کند تا نام‌های معادل
+// (مثل google-vertex یا anthropic) به کلید یکسان برسند.
+func normalizeProvider(pid string) string {
+	switch strings.ToLower(strings.TrimSpace(pid)) {
+	case "google-vertex", "vertex", "google-ai", "googleapis":
+		return "google"
+	case "openai-compatible", "chatgpt":
+		return "openai"
+	case "claude":
+		return "anthropic"
+	case "grok":
+		return "xai"
+	default:
+		return strings.ToLower(strings.TrimSpace(pid))
 	}
-	return model
 }

@@ -295,6 +295,35 @@ func (c *modelCatalog) provider(id string) (*catProv, bool) {
 	return &out, true
 }
 
+// providerOfModel پروایدری را پیدا می‌کند که مدل با شناسهٔ model را دارد. برای
+// وقتی که سرور فقط شناسهٔ مدل را بدهد و پروایدرش را نداشته باشیم.
+func (c *modelCatalog) providerOfModel(model string) (string, bool) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return "", false
+	}
+	if i := strings.IndexByte(model, '/'); i > 0 {
+		model = model[i+1:]
+	}
+	if err := c.ensure(); err != nil {
+		return "", false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, p := range c.provs {
+		for _, md := range p.Models {
+			id := md.ID
+			if i := strings.IndexByte(id, '/'); i > 0 {
+				id = id[i+1:]
+			}
+			if strings.EqualFold(id, model) {
+				return p.ID, true
+			}
+		}
+	}
+	return "", false
+}
+
 // searchProvs پروایدرهایی را برمی‌گرداند که نام/شناسه‌شان یا یکی از مدل‌هاشان
 // شامل query باشد.
 func (c *modelCatalog) searchProvs(q string) ([]catProv, error) {

@@ -30,7 +30,11 @@ type Session struct {
 		Files int `json:"files"`
 	} `json:"summary"`
 	ModelID string `json:"modelID"`
-	Time    struct {
+	Model   struct {
+		ID         string `json:"id"`
+		ProviderID string `json:"providerID"`
+	} `json:"model"`
+	Time struct {
 		Created int64 `json:"created"`
 		Updated int64 `json:"updated"`
 	} `json:"time"`
@@ -54,11 +58,12 @@ type PartState struct {
 // Message یک پیام کامل (اطلاعات + بخش‌ها) در نشست است.
 type Message struct {
 	Info struct {
-		ID        string `json:"id"`
-		Role      string `json:"role"`
-		SessionID string `json:"sessionID"`
-		ModelID   string `json:"modelID"`
-		Finish    string `json:"finish"`
+		ID         string `json:"id"`
+		Role       string `json:"role"`
+		SessionID  string `json:"sessionID"`
+		ModelID    string `json:"modelID"`
+		ProviderID string `json:"providerID"`
+		Finish     string `json:"finish"`
 	} `json:"info"`
 	Parts []Part `json:"parts"`
 }
