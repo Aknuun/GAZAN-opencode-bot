@@ -1,4 +1,4 @@
-# نگهبان اوپن کد — Negahban OpenCode (negahban-opencode)
+# نگهبان اوپن کد — Negahban OpenCode
 
 پل تلگرام برای [opencode](https://opencode.ai) روی سرور خودت.
 ربات تلگرام را به یک سرور headless «opencode» وصل می‌کند تا هر جا هستی با دستیار هوش مصنوعی سرورت گفتگو کنی، فایل بفرستی و مصرف/هزینه را ببینی.
