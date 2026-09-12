@@ -1,4 +1,4 @@
-module opencode-tg-bot
+module negahban-opencode
 
 go 1.22.2
 

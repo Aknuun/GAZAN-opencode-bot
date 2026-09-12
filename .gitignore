@@ -8,7 +8,7 @@ peakhours.json
 *.bak-*
 
 # build artifacts
-/opencode-tg-bot
+/negahban-opencode
 *.exe
 
 # uploads & downloads

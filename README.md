@@ -1,4 +1,4 @@
-# GAZAN-opencode-bot (opencode-tg-bot)
+# نگهبان اوپن کد — Negahban OpenCode (negahban-opencode)
 
 پل تلگرام برای [opencode](https://opencode.ai) روی سرور خودت.
 ربات تلگرام را به یک سرور headless «opencode» وصل می‌کند تا هر جا هستی با دستیار هوش مصنوعی سرورت گفتگو کنی، فایل بفرستی و مصرف/هزینه را ببینی.
@@ -31,7 +31,7 @@ A Telegram bridge for a headless opencode server running on your own VPS.
 ## نصب (یک‌دستوری)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Aknuun/GAZAN-opencode-bot/master/install.sh -o /tmp/opencode-tg-install.sh && sudo bash /tmp/opencode-tg-install.sh
+curl -fsSL https://raw.githubusercontent.com/Aknuun/Negahban-OpenCode/master/install.sh -o /tmp/negahban-opencode-install.sh && sudo bash /tmp/negahban-opencode-install.sh
 ```
 
 > ⚠️ از `sudo bash <(curl …)` استفاده نکن — `sudo` به فایل‌دسکریپتورِ process substitution دسترسی نمی‌دهد و با خطای `/dev/fd/63: No such file or directory` متوقف می‌شود. باید اسکریپت را اول دانلود و بعد با `sudo bash` اجرا کنی تا پرسش‌ها (توکن/آیدی) روی ترمینال خوانده شوند.
@@ -39,7 +39,7 @@ curl -fsSL https://raw.githubusercontent.com/Aknuun/GAZAN-opencode-bot/master/in
 نصب بدون ترمینال (غیرتعاملی، برای اسکریپت/اتوماسیون):
 
 ```bash
-TELEGRAM_BOT_TOKEN="توکن" ALLOWED_USER_IDS="123,456" sudo bash /tmp/opencode-tg-install.sh
+TELEGRAM_BOT_TOKEN="توکن" ALLOWED_USER_IDS="123,456" sudo bash /tmp/negahban-opencode-install.sh
 ```
 
 نصب‌کننده:
@@ -61,8 +61,8 @@ opencode serve --port 17890 --hostname 127.0.0.1 --print-logs &
 
 # سپس پل را اجرا کن
 cp .env.example .env   # و مقادیر را پر کن
-go build -o opencode-tg-bot .
-./opencode-tg-bot
+go build -o negahban-opencode .
+./negahban-opencode
 ```
 
 ## متغیرهای محیطی

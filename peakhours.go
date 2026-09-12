@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"opencode-tg-bot/internal/statefile"
+	"negahban-opencode/internal/statefile"
 )
 
 // ---------- ساعت پیک مصرف پروایدرها ----------

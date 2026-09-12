@@ -14,7 +14,7 @@ import (
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
-	"opencode-tg-bot/internal/occlient"
+	"negahban-opencode/internal/occlient"
 )
 
 // ocAPI اینترفیس API سرور opencode است؛ کانکریت آن occlient.Client است و در
@@ -62,7 +62,7 @@ const helpText = `ربات کنترل opencode روی سرور
 اگر مدل در میانهٔ کار سؤالی بپرسد (مثل خود CLI)، همان پیام گزینه‌ها را دارد؛ با دکمه‌ها پاسخ بده تا اجرا ادامه یابد. ✏️ یعنی می‌توانی پاسخ خودت را تایپ کنی.`
 
 // botVersion نسخهٔ ربات است؛ هنگام انتشار نسخهٔ جدید آن را به‌روز کن
-const botVersion = "v8.10"
+const botVersion = "v8.11"
 
 const (
 	btnStatus    = "وضعیت و هزینه"

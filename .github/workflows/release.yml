@@ -24,7 +24,7 @@ jobs:
           cache: true
 
       - name: Build
-        run: go build -ldflags "-s -w" -o opencode-tg-bot .
+        run: go build -ldflags "-s -w" -o negahban-opencode .
 
       - name: Test
         run: go vet ./... && go test ./...
@@ -35,4 +35,4 @@ jobs:
           name: ${{ github.ref_name }}
           tag_name: ${{ github.ref_name }}
           body_path: RELEASE_NOTES.md
-          files: opencode-tg-bot
+          files: negahban-opencode

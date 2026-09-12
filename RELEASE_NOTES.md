@@ -1,18 +1,16 @@
-# v8.10
+# v8.11 — نگهبان اوپن کد (Negahban OpenCode)
 
-## 🐛 رفع باگ تشخیص پروایدر در ساعت پیک
-- قبلاً فهرست پایان چت چیزی مثل «ساعت پیک deepseek-flash ثبت نشده است» نشان می‌داد؛ چون پروایدر از روی شناسهٔ مدل حدس زده می‌شد.
-- حالا پروایدر از **`providerID` واقعیِ opencode** (هم در نشست و هم در پیام) خوانده می‌شود؛ پس DeepSeek درست تشخیص داده می‌شود و ساعت پیکش ثبت و نمایش داده می‌شود.
-- اگر سرور `providerID` ندهد، به‌ترتیب از بخش `provider/model` و سپس **تطبیق شناسهٔ مدل با کاتالوگ** استفاده می‌شود.
+## 🏷 تغییر نام کامل پروژه
+- نام پروژه از «GAZAN-opencode-bot / opencode-tg-bot» به **«نگهبان اوپن کد» (Negahban-OpenCode)** تغییر کرد.
+- مخزن گیت‌هاب: `Aknuun/Negahban-OpenCode`
+- پوشه/باینری/سرویس: `negahban-opencode` (سرویس systemd: `negahban-opencode.service`)
+- ماژول Go، اسکریپت نصب، README و ورک‌فلوی انتشار همه با نام جدید هم‌گام شدند.
 
-## 🔇 رفتار روشن‌تر ساعت پیک
-- هنگام ارسال پیام: **فقط** اگر در بازهٔ پیک باشی هشدار/تأیید می‌گیری؛ خارج از پیک هیچ پیامی فرستاده نمی‌شود.
-- در پایان هر چت: ساعت پیک پروایدر همان مکالمه **ثبت** می‌شود و وضعیت 🟢/🔴 نشان داده می‌شود.
-- برای پروایدر ناشناس دیگر پیام گمراه‌کنندهٔ «ثبت نشده» نمایش داده نمی‌شود.
-
-## نصب / آپدیت
+## 🔗 آدرس‌های جدید
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Aknuun/GAZAN-opencode-bot/master/install.sh -o /tmp/opencode-tg-install.sh && sudo bash /tmp/opencode-tg-install.sh
+curl -fsSL https://raw.githubusercontent.com/Aknuun/Negahban-OpenCode/master/install.sh -o /tmp/negahban-opencode-install.sh && sudo bash /tmp/negahban-opencode-install.sh
 ```
 
-**Full Changelog**: https://github.com/Aknuun/GAZAN-opencode-bot/compare/v8.9...v8.10
+> اگر نصب قبلی داشتی، همان اسکریپت جدید را اجرا کن تا **آپدیت** شود؛ توکن و تنظیماتت حفظ می‌شود.
+
+**Full Changelog**: https://github.com/Aknuun/Negahban-OpenCode/compare/v8.10...v8.11

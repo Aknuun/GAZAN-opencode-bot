@@ -47,7 +47,7 @@ func loadEnvFile(path string) {
 
 func loadConfig() (*Config, error) {
 	loadEnvFile(".env")
-	loadEnvFile("/etc/opencode-tg-bot.env")
+	loadEnvFile("/etc/negahban-opencode.env")
 
 	cfg := &Config{
 		BaseURL:   getEnv("OPENCODE_BASE_URL", "http://127.0.0.1:14999"),

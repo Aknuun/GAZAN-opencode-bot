@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"opencode-tg-bot/internal/occlient"
-	"opencode-tg-bot/internal/statefile"
+	"negahban-opencode/internal/occlient"
+	"negahban-opencode/internal/statefile"
 )
 
 // UserState state ماندگار هر کاربر است (در state.json ذخیره می‌شود).

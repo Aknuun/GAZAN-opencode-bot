@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# GAZAN-opencode-bot (opencode-tg-bot) — نصب / آپدیت روی سرور خودت
+# Negahban-OpenCode (negahban-opencode) — نصب / آپدیت روی سرور خودت
 #
 # اجرا:
 #   از داخل پوشه پروژه:            sudo bash install.sh
 #   یا یک‌خطی از گیت‌هاب:
-#     curl -fsSL https://raw.githubusercontent.com/Aknuun/GAZAN-opencode-bot/master/install.sh -o /tmp/opencode-tg-install.sh \
-#       && sudo bash /tmp/opencode-tg-install.sh
+#     curl -fsSL https://raw.githubusercontent.com/Aknuun/Negahban-OpenCode/master/install.sh -o /tmp/negahban-opencode-install.sh \
+#       && sudo bash /tmp/negahban-opencode-install.sh
 #
 #   ⚠️ با «sudo bash <(curl …)» اجرا نکن: sudo فایل‌دسکریپتورِ process
 #   substitution را نمی‌دهد و اجرا با «/dev/fd/63: No such file or directory»
@@ -26,11 +26,11 @@ c_warn(){ printf '\033[33m%s\033[0m\n' "$*"; }
 c_err() { printf '\033[31m%s\033[0m\n' "$*"; }
 die(){ c_err "$*"; exit 1; }
 
-APP="opencode-tg-bot"
-REPO="${OPENCODE_TG_REPO:-Aknuun/GAZAN-opencode-bot}"
+APP="negahban-opencode"
+REPO="${NEGAHBAN_REPO:-Aknuun/Negahban-OpenCode}"
 SVC_OC="opencode-serve.service"
 SVC_BOT="${APP}.service"
-TARGET="${OPENCODE_TG_TARGET:-/root/$APP}"
+TARGET="${NEGAHBAN_TARGET:-/root/$APP}"
 
 [[ $EUID -eq 0 ]] || die "لطفاً با root اجرا کن:  sudo bash install.sh"
 command -v curl >/dev/null 2>&1 || die "curl نصب نیست؛ اول:  apt update && apt install -y curl"
@@ -61,7 +61,7 @@ else
 fi
 
 # در حالت آپدیت، اگر سورس محلیِ جدا داریم، آخرین نسخه را می‌گیریم
-if [[ "$MODE" == "update" && "${OPENCODE_TG_SKIP_FETCH:-0}" != "1" && ! -f "$SCRIPT_DIR/main.go" ]]; then
+if [[ "$MODE" == "update" && "${NEGAHBAN_SKIP_FETCH:-0}" != "1" && ! -f "$SCRIPT_DIR/main.go" ]]; then
   c_warn "دریافت آخرین نسخه…"
   curl -fsSL "https://github.com/$REPO/archive/refs/heads/master.tar.gz" -o /tmp/$APP-src.tar.gz
   tar xzf /tmp/$APP-src.tar.gz -C "$SRC" --strip-components=1
@@ -77,7 +77,7 @@ read_env() { # key -> مقدار (بدون مقدار پیش‌فرض)
 # اولویت: متغیر محیطی > فایل .env  (این‌طوری می‌شود غیرتعاملی هم نصب کرد)
 BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-$(read_env TELEGRAM_BOT_TOKEN)}"
 ALLOWED="${ALLOWED_USER_IDS:-$(read_env ALLOWED_USER_IDS)}"
-PORT="${OPENCODE_TG_PORT:-$(read_env OPENCODE_BASE_URL | sed -E 's|.*:([0-9]+)$|\1|' || true)}"
+PORT="${NEGAHBAN_PORT:-$(read_env OPENCODE_BASE_URL | sed -E 's|.*:([0-9]+)$|\1|' || true)}"
 
 ask() { # $1: نام متغیر   $2: پیام — تا پر شدن مقدار می‌پرسد.
   # اگر stdin ترمینال نیست (مثل curl … | sudo bash) از /dev/tty می‌خواند؛

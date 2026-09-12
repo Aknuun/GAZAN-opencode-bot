@@ -11,7 +11,7 @@ import (
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
-	"opencode-tg-bot/internal/occlient"
+	"negahban-opencode/internal/occlient"
 )
 
 // fakeTG پیاده‌سازی تستی از telegramAPI که همهٔ پیام‌های ارسالی را ضبط می‌کند.

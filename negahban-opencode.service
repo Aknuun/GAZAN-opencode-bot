@@ -5,9 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/root/opencode-tg-bot
-EnvironmentFile=/root/opencode-tg-bot/.env
-ExecStart=/root/opencode-tg-bot/opencode-tg-bot
+WorkingDirectory=/root/negahban-opencode
+EnvironmentFile=/root/negahban-opencode/.env
+ExecStart=/root/negahban-opencode/negahban-opencode
 Restart=always
 RestartSec=5
 

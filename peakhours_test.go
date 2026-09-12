@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"opencode-tg-bot/internal/occlient"
+	"negahban-opencode/internal/occlient"
 )
 
 func TestDeepseekPeakWindows(t *testing.T) {

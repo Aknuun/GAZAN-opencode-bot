@@ -6,7 +6,7 @@ import (
 	"sync"
 	"testing"
 
-	"opencode-tg-bot/internal/occlient"
+	"negahban-opencode/internal/occlient"
 )
 
 func TestUserStoreConcurrentActivate(t *testing.T) {
