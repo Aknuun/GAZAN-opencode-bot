@@ -62,7 +62,7 @@ const helpText = `ربات کنترل opencode روی سرور
 اگر مدل در میانهٔ کار سؤالی بپرسد (مثل خود CLI)، همان پیام گزینه‌ها را دارد؛ با دکمه‌ها پاسخ بده تا اجرا ادامه یابد. ✏️ یعنی می‌توانی پاسخ خودت را تایپ کنی.`
 
 // botVersion نسخهٔ ربات است؛ هنگام انتشار نسخهٔ جدید آن را به‌روز کن
-const botVersion = "v8.8"
+const botVersion = "v8.9"
 
 const (
 	btnStatus    = "وضعیت و هزینه"
@@ -103,7 +103,8 @@ type Bot struct {
 	qs    *qReg // سؤال‌های تعاملی در انتظار پاسخ
 	fx    *fxStore
 
-	cat *modelCatalog // کاتالوگ مدل‌ها (models.dev) با کش
+	cat   *modelCatalog // کاتالوگ مدل‌ها (models.dev) با کش
+	peaks *peakStore    // ساعت پیک مصرف پروایدرها
 }
 
 func newBot(cfg *Config, api telegramAPI) *Bot {
@@ -116,16 +117,24 @@ func newBot(cfg *Config, api telegramAPI) *Bot {
 		runs:  newRunManager(),
 		qs:    newQReg(),
 		fx:    newFXStore(),
-		cat:   newModelCatalog(filepath.Join(filepath.Dir(cfg.StateFile), "catalog-models.json")),
+		cat:   newModelCatalog(filepath.Join(filepath.Dir(cfg.StateFile), "catalog-models.json"), cfg.BaseURL),
+		peaks: newPeakStore(filepath.Join(filepath.Dir(cfg.StateFile), "peakhours.json")),
 	}
 }
 
 // close ذخیرهٔ نهایی state و توقف ذخیره‌کننده را انجام می‌دهد (قبل از خروج).
 func (b *Bot) close() error {
-	return b.users.Close()
+	err := b.users.Close()
+	if perr := b.peaks.close(); err == nil {
+		err = perr
+	}
+	return err
 }
 
 func (b *Bot) loadStates() error {
+	if err := b.peaks.load(); err != nil {
+		slog.Warn("بارگذاری ساعت پیک ناموفق بود", "error", err)
+	}
 	return b.users.load()
 }
 
@@ -438,6 +447,8 @@ var cbRoutes = []cbRoute{
 	{prefix: "qa:", run: questionAction},
 	{prefix: "stop:", run: stopRunAction},
 	{prefix: "cnt:", run: continueAction},
+	{prefix: "pk:", run: peakAction},
+	{prefix: "ds:", run: deleteSessionAction},
 }
 
 func settingsAction(b *Bot, cq *tgbotapi.CallbackQuery) {
@@ -454,6 +465,28 @@ func questionAction(b *Bot, cq *tgbotapi.CallbackQuery) {
 
 func stopRunAction(b *Bot, cq *tgbotapi.CallbackQuery) {
 	b.stopRun(strings.TrimPrefix(cq.Data, "stop:"))
+}
+
+// deleteSessionAction دکمهٔ «حذف این نشست» در پایان چت را انجام می‌دهد.
+func deleteSessionAction(b *Bot, cq *tgbotapi.CallbackQuery) {
+	sid := strings.TrimPrefix(cq.Data, "ds:")
+	chatID := cq.Message.Chat.ID
+	if sid == "" {
+		return
+	}
+	userID := b.userForChat(chatID)
+	if userID == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	err := b.oc.DeleteSession(ctx, sid)
+	cancel()
+	if err != nil {
+		b.editKeyboard(chatID, cq.Message.MessageID, "❌ حذف نشست ناموفق بود: "+err.Error(), &tgbotapi.InlineKeyboardMarkup{})
+		return
+	}
+	b.deleteSession(userID, sid)
+	b.editKeyboard(chatID, cq.Message.MessageID, "🗑 نشست حذف شد.", &tgbotapi.InlineKeyboardMarkup{})
 }
 
 func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
@@ -679,6 +712,50 @@ func (b *Bot) submitPrompt(userID, chatID int64, prompt string) {
 		b.askStopOrContinue(userID, chatID)
 		return
 	}
+	// اگر همین حالا در ساعت پیک گران پروایدر فعال باشیم، اول تأیید بگیر
+	if b.maybeAskPeak(userID, chatID, prompt) {
+		return
+	}
+	b.startPrompt(userID, chatID, prompt)
+}
+
+// activeProvider پروایدر مدلِ واقعیِ نشست فعال را برمی‌گرداند؛ اگر نشستی نبود یا
+// مدلش خوانده نشد، به مدل پیش‌فرض کانفیگ برمی‌گردد.
+func (b *Bot) activeProvider(userID int64) string {
+	if st := b.stateOf(userID); st != nil && st.SessionID != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if s, err := b.oc.GetSession(ctx, st.SessionID); err == nil && s != nil && s.ModelID != "" {
+			return providerOf(s.ModelID)
+		}
+	}
+	return providerOf(b.envFor().currentModel())
+}
+
+// maybeAskPeak اگر پروایدر مدل فعال در بازهٔ پیک باشد، پیام تأیید با دو دکمه
+// می‌فرستد و true برمی‌گرداند؛ در این حالت اجرا هنوز شروع نشده و منتظر پاسخ
+// کاربر می‌مانیم.
+func (b *Bot) maybeAskPeak(userID, chatID int64, prompt string) bool {
+	pid := b.activeProvider(userID)
+	if pid == "" {
+		return false
+	}
+	endMin, ok := b.peaks.peakEnd(pid, time.Now())
+	if !ok {
+		return false
+	}
+	b.ui.setPeakPending(chatID, peakPending{prompt: prompt, pid: pid})
+	msg := tgbotapi.NewMessage(chatID, peakPromptText(pid, endMin))
+	msg.ReplyMarkup = rowsOf([]tgbotapi.InlineKeyboardButton{
+		inlineBtn("نه بعدا میام", "pk:n"),
+		inlineBtn("بله ادامه بده", "pk:y"),
+	})
+	b.api.Send(msg)
+	return true
+}
+
+// startPrompt اجرای واقعی پرامپت را آغاز می‌کند (بعد از عبور از بررسی‌ها).
+func (b *Bot) startPrompt(userID, chatID int64, prompt string) {
 	st := b.stateFor(userID, chatID)
 	sid := st.SessionID
 	if sid == "" {
@@ -747,6 +824,75 @@ func continueAction(b *Bot, cq *tgbotapi.CallbackQuery) {
 	b.send(cq.Message.Chat.ID, "باشد؛ ادامه می‌دهم. وقتی تمام شد، پیامت را دوباره بفرست.")
 }
 
+// ---------- ساعت پیک ----------
+
+func peakAction(b *Bot, cq *tgbotapi.CallbackQuery) {
+	b.onPeakCallback(cq.Message.Chat.ID, cq.Message.MessageID, cq.Data)
+}
+
+func (b *Bot) onPeakCallback(chatID int64, msgID int, data string) {
+	userID := b.userForChat(chatID)
+	switch {
+	case data == "pk:y":
+		pp, ok := b.ui.takePeakPending(chatID)
+		b.removeInline(chatID, msgID)
+		if !ok || userID == 0 {
+			return
+		}
+		b.startPrompt(userID, chatID, pp.prompt)
+	case data == "pk:n":
+		b.ui.takePeakPending(chatID)
+		b.removeInline(chatID, msgID)
+		if userID != 0 {
+			b.send(chatID, "باشه؛ هر وقت خواستی دوباره بفرست. 👍")
+		}
+	case strings.HasPrefix(data, "pk:add:"):
+		pid := strings.TrimPrefix(data, "pk:add:")
+		windows, ok := b.lookupPeak(pid)
+		b.removeInline(chatID, msgID)
+		if !ok {
+			b.send(chatID, "متأسفانه ساعت پیک «"+peakProviderName(pid)+"» را پیدا نکردم؛ می‌توانی بعداً دستی اضافه‌اش کنم.")
+			return
+		}
+		b.peaks.enable(pid, windows)
+		b.send(chatID, "✅ یادآوری ساعت پیک «"+peakProviderName(pid)+"» فعال شد.\n"+formatWindows(windows))
+	case strings.HasPrefix(data, "pk:no:"):
+		pid := strings.TrimPrefix(data, "pk:no:")
+		b.peaks.disable(pid)
+		b.removeInline(chatID, msgID)
+	}
+}
+
+// lookupPeak ساعت پیک یک پروایدر را پیدا می‌کند. فعلاً از دانش داخلی (خوانده‌شده
+// از منابع رسمی) استفاده می‌کند؛ برای پروایدر ناشناس چیزی پیدا نمی‌شود.
+func (b *Bot) lookupPeak(pid string) ([]peakWindow, bool) {
+	ws := b.peaks.windowsFor(pid)
+	if len(ws) == 0 {
+		return nil, false
+	}
+	return ws, true
+}
+
+// askPeakForProvider هنگام افزودن کلید API می‌پرسد آیا ساعت پیک این پروایدر
+// پیدا/فعال شود.
+func (b *Bot) askPeakForProvider(chatID int64, pid string) {
+	name := peakProviderName(pid)
+	ws := b.peaks.windowsFor(pid)
+	var text string
+	if len(ws) > 0 {
+		text = "⏰ ساعت پیک (گران) «" + name + "» را می‌شناسم:\n" + formatWindows(ws) +
+			"\n\nهر وقت در این ساعات ازش استفاده کنی، قبل از اجرا یادآوری کنم؟"
+	} else {
+		text = "⏰ ساعت پیک (گران) «" + name + "» را نمی‌دانم.\nمی‌خواهی برایت پیدا و فعالش کنم تا موقع استفاده یادآوری شود؟"
+	}
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyMarkup = rowsOf([]tgbotapi.InlineKeyboardButton{
+		inlineBtn("بله، پیدا و فعال کن", "pk:add:"+pid),
+		inlineBtn("نه، لازم نیست", "pk:no:"+pid),
+	})
+	b.api.Send(msg)
+}
+
 // sessionUsage آمار فعلی مصرف نشست را از سرور می‌خواند.
 func (b *Bot) sessionUsage(sid string) (usage, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -808,11 +954,37 @@ func (b *Bot) sendRunSummary(r *runCtl, res pollResult, pre usage, preOK bool) {
 	fmt.Fprintf(&sb, "⏱ مدت: %s\n", durText(secs))
 	if curOK {
 		fmt.Fprintf(&sb, "🔢 توکن: ورودی %s · خروجی %s\n", abbrev(in), abbrev(out))
-		fmt.Fprintf(&sb, "💵 هزینه: %s", b.costText(cost))
+		fmt.Fprintf(&sb, "💵 هزینه: %s\n", b.costText(cost))
 	} else {
-		sb.WriteString("💵 آمار هزینه در دسترس نبود")
+		sb.WriteString("💵 آمار هزینه در دسترس نبود\n")
 	}
-	b.send(r.ChatID, sb.String())
+	// اطلاعات پیک مصرف پروایدرِ همین مکالمه
+	if pid := providerOf(model); pid != "" {
+		sb.WriteString("━━━━━━━━━━━━━━━━\n")
+		sb.WriteString(b.peaks.statusText(pid, time.Now()))
+	}
+	b.sendSummaryWithDelete(r.ChatID, sb.String(), r.SID)
+}
+
+// deleteWindow مدت باقی‌ماندن دکمهٔ حذف نشست در پایان چت است؛ اگر کاربر در این
+// بازه نزند، نشست باقی می‌ماند و دکمه برداشته می‌شود.
+const deleteWindow = 10 * time.Second
+
+// sendSummaryWithDelete پیامِ پایان چت را با دکمهٔ حذف نشست می‌فرستد و بعد از
+// deleteWindow دکمه را برمی‌دارد. اگر کاربر دکمه را بزند، حذف انجام می‌شود.
+func (b *Bot) sendSummaryWithDelete(chatID int64, text, sid string) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyMarkup = rowsOf([]tgbotapi.InlineKeyboardButton{
+		inlineBtn("🗑 حذف این نشست", "ds:"+sid),
+	})
+	m, err := b.api.Send(msg)
+	if err != nil || m.MessageID == 0 {
+		return
+	}
+	go func(chatID int64, msgID int) {
+		time.Sleep(deleteWindow)
+		b.removeInline(chatID, msgID)
+	}(chatID, m.MessageID)
 }
 
 func (b *Bot) poll(ctx context.Context, r *runCtl, progressMsg int, startModel string) pollResult {

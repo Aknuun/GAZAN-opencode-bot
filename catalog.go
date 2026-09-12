@@ -18,6 +18,10 @@ import (
 const catalogURL = "https://models.dev/api.json"
 const catalogTTL = 24 * time.Hour
 
+// هر چند وقت یک‌بار مدل‌ها را از خود سرور opencode تازه کنیم تا همیشه
+// با مدل‌های واقعیِ opencode (شامل پروایدرهای سفارشی) سینک باشد.
+const opencodeSyncTTL = 2 * time.Minute
+
 // catModel یک مدل شناخته‌شده در کاتالوگ
 type catModel struct {
 	ID   string
@@ -35,36 +39,65 @@ type modelCatalog struct {
 	mu        sync.Mutex
 	load      sync.Mutex // بارگذاری تکی (singleflight ساده)
 	cachePath string
+	baseURL   string    // آدرس سرور opencode برای سینک زندهٔ مدل‌ها
 	provs     []catProv // مرتب‌شده بر اساس نام
 	byID      map[string]*catProv
 	loadedAt  time.Time
+	syncedAt  time.Time // آخرین تلاش برای سینک با opencode
+	source    string    // "opencode" یا "models.dev"
 	failed    error
 }
 
-func newModelCatalog(cachePath string) *modelCatalog {
-	return &modelCatalog{cachePath: cachePath, byID: map[string]*catProv{}}
+func newModelCatalog(cachePath string, baseURL ...string) *modelCatalog {
+	c := &modelCatalog{cachePath: cachePath, byID: map[string]*catProv{}}
+	if len(baseURL) > 0 {
+		c.baseURL = strings.TrimRight(baseURL[0], "/")
+	}
+	return c
 }
 
-// ensure کاتالوگ را بارگذاری می‌کند: اول کش تازه، بعد دانلود؛
-// اگر دانلود خطا داد کش قدیمی (منقضی‌شده) را هم قبول می‌کند.
+// ensure کاتالوگ را بارگذاری می‌کند: اول سینک زنده با خود opencode،
+// بعد کش/دانلود models.dev؛ اگر دانلود خطا داد کش قدیمی را هم قبول می‌کند.
 func (c *modelCatalog) ensure() error {
 	c.load.Lock()
 	defer c.load.Unlock()
 
 	c.mu.Lock()
-	loaded := len(c.byID) > 0 && time.Since(c.loadedAt) < catalogTTL
+	hasData := len(c.byID) > 0
+	fresh := hasData && time.Since(c.loadedAt) < catalogTTL
+	trySync := c.baseURL != "" && time.Since(c.syncedAt) >= opencodeSyncTTL
 	c.mu.Unlock()
-	if loaded {
+
+	// ۱) منبع معتبر: خود سرور opencode (شامل پروایدرهای سفارشی کانفیگ)
+	if trySync {
+		c.mu.Lock()
+		c.syncedAt = time.Now()
+		c.mu.Unlock()
+		if raw, err := fetchOpencodeProviders(c.baseURL); err == nil {
+			if err := c.parseOpencode(raw); err == nil {
+				return nil
+			}
+		}
+	}
+
+	if fresh {
 		return nil
 	}
+
+	// ۲) کش تازهٔ models.dev
 	if raw, ok := c.readRaw(); ok && time.Since(c.fileModTime()) < catalogTTL {
-		return c.parse(raw)
+		if err := c.parse(raw); err == nil {
+			return nil
+		}
 	}
+	// ۳) دانلود models.dev
 	raw, err := fetchCatalog()
 	if err != nil {
 		// کش قدیمی بهتر از هیچ است
 		if raw2, ok := c.readRaw(); ok {
-			return c.parse(raw2)
+			if perr := c.parse(raw2); perr == nil {
+				return nil
+			}
 		}
 		c.mu.Lock()
 		c.failed = err
@@ -117,6 +150,22 @@ func fetchCatalog() ([]byte, error) {
 	return io.ReadAll(io.LimitReader(resp.Body, 30<<20))
 }
 
+// fetchOpencodeProviders فهرست پروایدر/مدل‌های خود سرور opencode را از
+// endpoint استاندارد /provider می‌گیرد؛ این دقیقاً همان چیزی است که opencode
+// می‌شناسد (مدل‌های models.dev + پروایدرهای سفارشی کانفیگ).
+func fetchOpencodeProviders(baseURL string) ([]byte, error) {
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(strings.TrimRight(baseURL, "/") + "/provider")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("opencode /provider: %s", resp.Status)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, 60<<20))
+}
+
 // parse خروجی api.json را به ساختار داخلی تبدیل می‌کند
 func (c *modelCatalog) parse(raw []byte) error {
 	var m map[string]struct {
@@ -162,6 +211,61 @@ func (c *modelCatalog) parse(raw []byte) error {
 	c.provs = provs
 	c.byID = byID
 	c.loadedAt = time.Now()
+	c.source = "models.dev"
+	c.failed = nil
+	c.mu.Unlock()
+	return nil
+}
+
+// parseOpencode خروجی /provider سرور opencode را به ساختار داخلی تبدیل می‌کند.
+func (c *modelCatalog) parseOpencode(raw []byte) error {
+	var payload struct {
+		All []struct {
+			ID     string `json:"id"`
+			Name   string `json:"name"`
+			Models map[string]struct {
+				Name string `json:"name"`
+			} `json:"models"`
+		} `json:"all"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return fmt.Errorf("پارس کاتالوگ opencode: %v", err)
+	}
+	if len(payload.All) == 0 {
+		return fmt.Errorf("کاتالوگ opencode خالی است")
+	}
+	provs := make([]catProv, 0, len(payload.All))
+	for _, p := range payload.All {
+		cp := catProv{ID: p.ID, Name: p.Name}
+		if cp.Name == "" {
+			cp.Name = p.ID
+		}
+		for mid, m := range p.Models {
+			name := m.Name
+			if name == "" {
+				name = mid
+			}
+			cp.Models = append(cp.Models, catModel{ID: mid, Name: name})
+		}
+		sort.Slice(cp.Models, func(i, j int) bool {
+			return strings.ToLower(cp.Models[i].ID) < strings.ToLower(cp.Models[j].ID)
+		})
+		if len(cp.Models) > 0 {
+			provs = append(provs, cp)
+		}
+	}
+	sort.Slice(provs, func(i, j int) bool {
+		return strings.ToLower(provs[i].Name) < strings.ToLower(provs[j].Name)
+	})
+	byID := make(map[string]*catProv, len(provs))
+	for i := range provs {
+		byID[provs[i].ID] = &provs[i]
+	}
+	c.mu.Lock()
+	c.provs = provs
+	c.byID = byID
+	c.loadedAt = time.Now()
+	c.source = "opencode"
 	c.failed = nil
 	c.mu.Unlock()
 	return nil

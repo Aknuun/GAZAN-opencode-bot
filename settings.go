@@ -285,6 +285,9 @@ func (b *Bot) removeKey(chatID int64, msgID int, pid string) {
 		return
 	}
 	b.editSettings(chatID, msgID, "🗑 کلید <code>"+pid+"</code> حذف شد.", settingsMainMarkup())
+	if err := env.restart(); err != nil {
+		b.send(chatID, "⚠️ ری‌استارت خودکار نشد؛ /new بزن یا سرور را دستی ری‌استارت کن.")
+	}
 }
 
 func (b *Bot) showAgentPicker(chatID int64, msgID int) {
@@ -431,6 +434,7 @@ func (b *Bot) handlePending(userID, chatID int64, pending, text string) {
 		}
 		b.send(chatID, "🔑 کلید <code>"+pid+"</code> ست شد."+note)
 		b.restartAfter(chatID)
+		b.askPeakForProvider(chatID, pid)
 	}
 }
 

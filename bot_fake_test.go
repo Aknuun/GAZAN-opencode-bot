@@ -64,6 +64,8 @@ func chatText(c tgbotapi.Chattable) string {
 // fakeOC پیاده‌سازی تستی از ocAPI است.
 type fakeOC struct {
 	created int
+	session *occlient.Session
+	sessErr error
 }
 
 func (f *fakeOC) CreateSession(ctx context.Context) (*occlient.Session, error) {
@@ -75,6 +77,9 @@ func (f *fakeOC) ListSessions(ctx context.Context, limit int) ([]occlient.Sessio
 }
 func (f *fakeOC) DeleteSession(ctx context.Context, id string) error { return nil }
 func (f *fakeOC) GetSession(ctx context.Context, id string) (*occlient.Session, error) {
+	if f.session != nil || f.sessErr != nil {
+		return f.session, f.sessErr
+	}
 	return nil, errFake
 }
 func (f *fakeOC) PromptAsync(ctx context.Context, sessionID, prompt, agent string) error {

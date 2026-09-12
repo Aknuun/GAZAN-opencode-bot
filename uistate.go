@@ -11,6 +11,13 @@ type costInfo struct {
 	label string
 }
 
+// peakPending پرامپتی است که به‌خاطر ساعات پیک هنوز اجرا نشده و منتظر تأیید
+// کاربر است.
+type peakPending struct {
+	prompt string
+	pid    string
+}
+
 // uiState داده‌های گذرای رابط کاربری (نه state ماندگار) هر چت را زیر قفل خودش
 // نگه می‌دارد: صفحهٔ مدل‌های باز، جست‌وجو، صفحهٔ «نشست‌ها»، حالت گروهی و کش هزینه.
 type uiState struct {
@@ -21,6 +28,7 @@ type uiState struct {
 	gsm  map[int64]bool
 	gsl  map[int64]map[string]bool
 	cost map[int64]costInfo
+	pk   map[int64]peakPending
 }
 
 func newUIState() *uiState {
@@ -31,7 +39,26 @@ func newUIState() *uiState {
 		gsm:  map[int64]bool{},
 		gsl:  map[int64]map[string]bool{},
 		cost: map[int64]costInfo{},
+		pk:   map[int64]peakPending{},
 	}
+}
+
+// ---------- پرامپت معلق در ساعت پیک ----------
+
+func (u *uiState) setPeakPending(chatID int64, p peakPending) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.pk[chatID] = p
+}
+
+func (u *uiState) takePeakPending(chatID int64) (peakPending, bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	p, ok := u.pk[chatID]
+	if ok {
+		delete(u.pk, chatID)
+	}
+	return p, ok
 }
 
 // ---------- صفحهٔ مدل‌های باز و جست‌وجو ----------

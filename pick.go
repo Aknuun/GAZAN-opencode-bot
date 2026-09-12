@@ -191,7 +191,13 @@ func (b *Bot) renderProvScreen(chatID int64, msgID int, mode string, items []pro
 			data = "s:pv:" + it.id
 		}
 		row = append(row, inlineBtn(label, data))
-		if len(row) == 2 {
+		if mode == "key" && strings.HasSuffix(it.label, "✅") {
+			row = append(row, inlineBtn("🗑", "s:krm:"+it.id))
+		}
+		if mode == "key" {
+			rows = append(rows, row)
+			row = nil
+		} else if len(row) == 2 {
 			rows = append(rows, row)
 			row = nil
 		}
@@ -324,7 +330,11 @@ func (b *Bot) renderModelsScreen(chatID int64, msgID int, page int) {
 	var rows [][]tgbotapi.InlineKeyboardButton
 	cur := env.currentModel()
 	for i, m := range mods[start:end] {
-		label2 := clipHead(m.ID, 50)
+		label2 := m.ID
+		if m.Name != "" && !strings.EqualFold(m.Name, m.ID) {
+			label2 = m.Name + " · " + m.ID
+		}
+		label2 = clipHead(label2, 60)
 		if cur == pid+"/"+m.ID {
 			label2 += " ← فعلی"
 		}

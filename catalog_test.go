@@ -37,3 +37,31 @@ func TestCatalogParseAndSearch(t *testing.T) {
 		t.Fatalf("filter llama on hetzner should be empty, got %+v (known=%v)", mods2, known2)
 	}
 }
+
+func TestCatalogParseOpencode(t *testing.T) {
+	c := newModelCatalog("")
+	raw := []byte(`{
+  "all": [
+    {"id": "deepseek", "name": "DeepSeek", "models": {
+      "deepseek-v4-flash": {"name": "DeepSeek V4 Flash"},
+      "deepseek-flash": {"name": "DeepSeek V4.1 Flash"}
+    }},
+    {"id": "empty", "name": "Empty Co", "models": {}}
+  ],
+  "default": {},
+  "connected": []
+}`)
+	if err := c.parseOpencode(raw); err != nil {
+		t.Fatalf("parseOpencode: %v", err)
+	}
+	if len(c.provs) != 1 {
+		t.Fatalf("providers with zero models should be dropped; got %d", len(c.provs))
+	}
+	mods, known, err := c.modelsOf("deepseek", "4.1")
+	if err != nil || !known {
+		t.Fatalf("modelsOf: known=%v err=%v", known, err)
+	}
+	if len(mods) != 1 || mods[0].ID != "deepseek-flash" || mods[0].Name != "DeepSeek V4.1 Flash" {
+		t.Fatalf("unexpected models: %+v", mods)
+	}
+}

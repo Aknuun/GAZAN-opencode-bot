@@ -2,6 +2,7 @@
 .env
 state.json
 catalog-models.json
+peakhours.json
 *.log
 *.bak
 *.bak-*
